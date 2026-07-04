@@ -25,11 +25,11 @@ func (bc *bufferedConn) Read(p []byte) (int, error) {
 
 func (bc *bufferedConn) Peek(n int, timeout time.Duration) ([]byte, error) {
 	if timeout > 0 {
-		if err := bc.Conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		if err := bc.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 			return nil, err
 		}
 		defer func() {
-			_ = bc.Conn.SetReadDeadline(time.Time{})
+			_ = bc.SetReadDeadline(time.Time{})
 		}()
 	}
 

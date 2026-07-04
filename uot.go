@@ -2,7 +2,6 @@ package anytls
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync"
 
@@ -12,7 +11,7 @@ import (
 	"github.com/sagernet/sing/common/uot"
 )
 
-func relayUDPOverTCP(ctx context.Context, inbound *uot.Conn, outbound net.PacketConn, validate func(M.Socksaddr) error, onClose N.CloseHandlerFunc) {
+func relayUDPOverTCP(ctx context.Context, inbound *uot.Conn, outbound net.PacketConn, prepareDestination func(context.Context, M.Socksaddr) (net.Addr, error), onClose N.CloseHandlerFunc) {
 	var once sync.Once
 	closeAll := func(err error) {
 		once.Do(func() {
@@ -30,14 +29,14 @@ func relayUDPOverTCP(ctx context.Context, inbound *uot.Conn, outbound net.Packet
 	}()
 
 	go func() {
-		closeAll(proxyUOTToPacket(inbound, outbound, validate))
+		closeAll(proxyUOTToPacket(ctx, inbound, outbound, prepareDestination))
 	}()
 	go func() {
 		closeAll(proxyPacketToUOT(outbound, inbound))
 	}()
 }
 
-func proxyUOTToPacket(inbound *uot.Conn, outbound net.PacketConn, validate func(M.Socksaddr) error) error {
+func proxyUOTToPacket(ctx context.Context, inbound *uot.Conn, outbound net.PacketConn, prepareDestination func(context.Context, M.Socksaddr) (net.Addr, error)) error {
 	packet := buf.NewPacket()
 	defer packet.Release()
 
@@ -47,13 +46,9 @@ func proxyUOTToPacket(inbound *uot.Conn, outbound net.PacketConn, validate func(
 		if err != nil {
 			return err
 		}
-		if err := validate(destination); err != nil {
-			return err
-		}
-
-		addr, err := resolveUDPAddr(destination)
+		addr, err := prepareDestination(ctx, destination)
 		if err != nil {
-			return fmt.Errorf("resolve udp destination %s: %w", destination.String(), err)
+			return err
 		}
 		if _, err := outbound.WriteTo(packet.Bytes(), addr); err != nil {
 			return err

@@ -24,10 +24,9 @@ type Detector interface {
 }
 
 var (
-	errShortPreview      = fmt.Errorf("short preview")
-	errUnknownUserHash   = fmt.Errorf("unknown user hash")
-	errDisabledUserHash  = fmt.Errorf("disabled user")
-	errInvalidAnyTLSPeek = fmt.Errorf("invalid anytls preview")
+	errShortPreview     = fmt.Errorf("short preview")
+	errUnknownUserHash  = fmt.Errorf("unknown user hash")
+	errDisabledUserHash = fmt.Errorf("disabled user")
 )
 
 // PasswordHashDetector matches the leading AnyTLS password hash used by the

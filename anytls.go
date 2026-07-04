@@ -6,6 +6,7 @@ package anytls
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -29,7 +30,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(ListenerWrapper{})
+	caddy.RegisterModule(&ListenerWrapper{})
 }
 
 // ListenerWrapper is a Caddy listener wrapper that peeks decrypted bytes to
@@ -48,12 +49,14 @@ type ListenerWrapper struct {
 	logger           *zap.Logger
 	active           int64
 	connSeq          uint64
+	fallbackSet      bool
 	registry         *sessionRegistry
 	detector         Detector
 	service          *singanytls.Service
 	websiteConns     sync.Map
 	dialFunc         func(ctx context.Context, network string, address string) (net.Conn, error)
 	listenPacketFunc func(ctx context.Context, network string, address string) (net.PacketConn, error)
+	resolveFunc      func(ctx context.Context, network string, host string) ([]netip.Addr, error)
 }
 
 // User defines one AnyTLS account.
@@ -64,7 +67,7 @@ type User struct {
 }
 
 // CaddyModule returns the Caddy module information.
-func (ListenerWrapper) CaddyModule() caddy.ModuleInfo {
+func (*ListenerWrapper) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "caddy.listeners.anytls",
 		New: func() caddy.Module { return new(ListenerWrapper) },
@@ -87,7 +90,7 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	if lw.MaxConcurrent == 0 {
 		lw.MaxConcurrent = 128
 	}
-	if !lw.Fallback {
+	if !lw.fallbackSet {
 		lw.Fallback = true
 	}
 	if lw.PaddingScheme == "" {
@@ -96,7 +99,7 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	if lw.registry == nil {
 		lw.registry = newSessionRegistry()
 	}
-	if server, ok := ctx.Context.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && server != nil {
+	if server, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && server != nil {
 		server.RegisterConnContext(lw.websiteConnContext)
 		server.RegisterConnState(lw.cleanupWebsiteConn)
 	}
@@ -206,6 +209,7 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return err
 			}
 			lw.Fallback = value
+			lw.fallbackSet = true
 
 		case "allow_private_targets":
 			value, err := parseBoolDirective(d, "allow_private_targets")
@@ -236,6 +240,63 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 	}
 
+	return nil
+}
+
+// UnmarshalJSON preserves explicit false values for booleans with non-zero
+// defaults and applies the documented enabled-by-default user behavior.
+func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
+	var config struct {
+		Users               []User         `json:"users,omitempty"`
+		ProbeTimeout        caddy.Duration `json:"probe_timeout,omitempty"`
+		IdleTimeout         caddy.Duration `json:"idle_timeout,omitempty"`
+		ConnectTimeout      caddy.Duration `json:"connect_timeout,omitempty"`
+		MaxConcurrent       int            `json:"max_concurrent,omitempty"`
+		Fallback            bool           `json:"fallback,omitempty"`
+		AllowPrivateTargets bool           `json:"allow_private_targets,omitempty"`
+		PaddingScheme       string         `json:"padding_scheme,omitempty"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return err
+	}
+	lw.Users = config.Users
+	lw.ProbeTimeout = config.ProbeTimeout
+	lw.IdleTimeout = config.IdleTimeout
+	lw.ConnectTimeout = config.ConnectTimeout
+	lw.MaxConcurrent = config.MaxConcurrent
+	lw.Fallback = config.Fallback
+	lw.AllowPrivateTargets = config.AllowPrivateTargets
+	lw.PaddingScheme = config.PaddingScheme
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["fallback"]; ok {
+		lw.fallbackSet = true
+	} else {
+		lw.Fallback = true
+	}
+	return nil
+}
+
+// UnmarshalJSON makes JSON users enabled by default while still allowing
+// "enabled": false to disable an account.
+func (u *User) UnmarshalJSON(data []byte) error {
+	type userAlias User
+	var alias userAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*u = User(alias)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["enabled"]; !ok {
+		u.Enabled = true
+	}
 	return nil
 }
 
@@ -301,7 +362,7 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 }
 
 func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, closeOnce N.CloseHandlerFunc) {
-	request, err := h.readUDPOverTCPRequest(conn, destination)
+	request, err := h.readUDPOverTCPRequest(ctx, conn, destination)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
 		closeOnce(err)
@@ -329,11 +390,12 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 		zap.String("destination", request.Destination.String()),
 	)
 
-	relayUDPOverTCP(ctx, uotConn, packetConn, h.validatePacketDestination, closeOnce)
+	relayUDPOverTCP(ctx, uotConn, packetConn, h.preparePacketDestination, closeOnce)
 }
 
 func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	if err := h.validateStreamDestination(destination); err != nil {
+	resolvedDestination, err := h.validateStreamDestination(ctx, destination)
+	if err != nil {
 		return nil, err
 	}
 
@@ -341,9 +403,9 @@ func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksa
 		Timeout: time.Duration(h.config.ConnectTimeout),
 	}
 	if h.config.dialFunc != nil {
-		return h.config.dialFunc(ctx, "tcp", destination.String())
+		return h.config.dialFunc(ctx, "tcp", resolvedDestination.String())
 	}
-	return dialer.DialContext(ctx, "tcp", destination.String())
+	return dialer.DialContext(ctx, "tcp", resolvedDestination.String())
 }
 
 func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {
@@ -355,7 +417,7 @@ func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketC
 	return listenConfig.ListenPacket(ctx, "udp", "")
 }
 
-func (h *directTCPHandler) readUDPOverTCPRequest(conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {
+func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {
 	switch destination.Fqdn {
 	case uot.MagicAddress:
 		request, err := uot.ReadRequest(conn)
@@ -363,7 +425,7 @@ func (h *directTCPHandler) readUDPOverTCPRequest(conn net.Conn, destination M.So
 			return nil, fmt.Errorf("%w: %w", errInvalidUDPOverTCPRequest, err)
 		}
 		if request.IsConnect {
-			if err := h.validatePacketDestination(request.Destination); err != nil {
+			if _, err := h.validatePacketDestination(ctx, request.Destination); err != nil {
 				return nil, err
 			}
 		}
@@ -375,24 +437,71 @@ func (h *directTCPHandler) readUDPOverTCPRequest(conn net.Conn, destination M.So
 	}
 }
 
-func (h *directTCPHandler) validateStreamDestination(destination M.Socksaddr) error {
+func (h *directTCPHandler) validateStreamDestination(ctx context.Context, destination M.Socksaddr) (M.Socksaddr, error) {
 	if !destination.IsValid() || destination.Port == 0 {
-		return fmt.Errorf("%w", errInvalidDestination)
+		return M.Socksaddr{}, fmt.Errorf("%w", errInvalidDestination)
 	}
-	if !h.config.AllowPrivateTargets && isPrivateDestination(destination) {
-		return fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+	if h.config.AllowPrivateTargets {
+		return destination, nil
 	}
-	return nil
+	resolvedDestination, err := h.resolveDestination(ctx, destination)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	if isPrivateDestination(resolvedDestination) {
+		return M.Socksaddr{}, fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+	}
+	return resolvedDestination, nil
 }
 
-func (h *directTCPHandler) validatePacketDestination(destination M.Socksaddr) error {
+func (h *directTCPHandler) validatePacketDestination(ctx context.Context, destination M.Socksaddr) (M.Socksaddr, error) {
 	if !destination.IsValid() || destination.Port == 0 {
-		return fmt.Errorf("%w", errInvalidDestination)
+		return M.Socksaddr{}, fmt.Errorf("%w", errInvalidDestination)
 	}
-	if !h.config.AllowPrivateTargets && isPrivateDestination(destination) {
-		return fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+	if h.config.AllowPrivateTargets {
+		return destination, nil
 	}
-	return nil
+	resolvedDestination, err := h.resolveDestination(ctx, destination)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	if isPrivateDestination(resolvedDestination) {
+		return M.Socksaddr{}, fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+	}
+	return resolvedDestination, nil
+}
+
+func (h *directTCPHandler) preparePacketDestination(ctx context.Context, destination M.Socksaddr) (net.Addr, error) {
+	resolvedDestination, err := h.validatePacketDestination(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	return resolveUDPAddr(resolvedDestination)
+}
+
+func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M.Socksaddr) (M.Socksaddr, error) {
+	if destination.Addr.IsValid() {
+		return destination, nil
+	}
+	resolveFunc := h.config.resolveFunc
+	if resolveFunc == nil {
+		resolver := net.DefaultResolver
+		resolveFunc = resolver.LookupNetIP
+	}
+	addresses, err := resolveFunc(ctx, "ip", destination.Fqdn)
+	if err != nil {
+		return M.Socksaddr{}, fmt.Errorf("resolve destination %s: %w", destination.String(), err)
+	}
+	if len(addresses) == 0 {
+		return M.Socksaddr{}, fmt.Errorf("resolve destination %s: no addresses", destination.String())
+	}
+	for _, addr := range addresses {
+		resolved := M.Socksaddr{Addr: addr, Port: destination.Port}
+		if isPrivateDestination(resolved) {
+			return M.Socksaddr{}, fmt.Errorf("%w: %s resolves to %s", errPrivateDestinationDenied, destination.String(), addr.String())
+		}
+	}
+	return M.Socksaddr{Addr: addresses[0], Port: destination.Port}, nil
 }
 
 func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, err error) {
@@ -423,13 +532,18 @@ func isPrivateDestination(destination M.Socksaddr) bool {
 		return false
 	}
 	addr := destination.Addr.Unmap()
+	if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsUnspecified() || addr.IsMulticast() {
+		return true
+	}
 	privateRanges := []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/8"),
 		netip.MustParsePrefix("172.16.0.0/12"),
 		netip.MustParsePrefix("192.168.0.0/16"),
+		netip.MustParsePrefix("100.64.0.0/10"),
 		netip.MustParsePrefix("127.0.0.0/8"),
 		netip.MustParsePrefix("169.254.0.0/16"),
 		netip.MustParsePrefix("::1/128"),
+		netip.MustParsePrefix("::/128"),
 		netip.MustParsePrefix("fc00::/7"),
 		netip.MustParsePrefix("fe80::/10"),
 	}

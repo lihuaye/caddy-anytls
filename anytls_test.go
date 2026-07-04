@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -38,8 +39,8 @@ import (
 
 func TestBufferedConnPeekPreservesBytes(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer closeTest(server)
+	defer closeTest(client)
 
 	go func() {
 		_, _ = client.Write([]byte("GET / HTTP/1.1\r\n"))
@@ -85,8 +86,8 @@ func TestBufferedConnPreservesConnectionState(t *testing.T) {
 
 func TestBufferedConnBufferedBytesPreservesBytes(t *testing.T) {
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer closeTest(server)
+	defer closeTest(client)
 
 	go func() {
 		_, _ = client.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
@@ -121,12 +122,12 @@ func TestBufferedConnBufferedBytesPreservesBytes(t *testing.T) {
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name    string
-		config  ListenerWrapper
+		config  *ListenerWrapper
 		wantErr bool
 	}{
 		{
 			name: "valid config",
-			config: ListenerWrapper{
+			config: &ListenerWrapper{
 				MaxConcurrent: 1,
 				Users: []User{
 					{Name: "alice", Password: "secret", Enabled: true},
@@ -136,7 +137,7 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name: "duplicate user",
-			config: ListenerWrapper{
+			config: &ListenerWrapper{
 				Users: []User{
 					{Name: "alice", Password: "secret"},
 					{Name: "alice", Password: "secret-2"},
@@ -146,14 +147,14 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name: "negative concurrency",
-			config: ListenerWrapper{
+			config: &ListenerWrapper{
 				MaxConcurrent: -1,
 			},
 			wantErr: true,
 		},
 		{
 			name: "empty password",
-			config: ListenerWrapper{
+			config: &ListenerWrapper{
 				Users: []User{
 					{Name: "alice"},
 				},
@@ -179,7 +180,7 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	wrapped := wrapper.WrapListener(base)
 	request := "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
@@ -192,7 +193,7 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 
 		buf := make([]byte, len(request))
 		if _, err := io.ReadFull(conn, buf); err != nil {
@@ -209,7 +210,7 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 	}()
 
 	serverConn, client := net.Pipe()
-	defer client.Close()
+	defer closeTest(client)
 	base.enqueue(serverConn)
 
 	if _, err := io.WriteString(client, request); err != nil {
@@ -232,7 +233,7 @@ func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	tlsListener := tls.NewListener(base, &tls.Config{
 		Certificates: []tls.Certificate{newTestCertificate(t)},
@@ -247,7 +248,7 @@ func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 
 		if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
 			serverErr <- errors.New("wrapped listener should not expose ConnectionState on fallback connection")
@@ -286,7 +287,7 @@ func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 		NextProtos:         []string{"h2"},
 		ServerName:         "example.test",
 	})
-	defer client.Close()
+	defer closeTest(client)
 
 	if err := client.Handshake(); err != nil {
 		t.Fatalf("client Handshake() error = %v", err)
@@ -307,7 +308,7 @@ func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	tlsListener := tls.NewListener(base, &tls.Config{
 		Certificates: []tls.Certificate{newTestCertificate(t)},
@@ -322,7 +323,7 @@ func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 
 		if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
 			serverErr <- errors.New("wrapped listener should not expose ConnectionState on fallback connection")
@@ -366,7 +367,7 @@ func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 		NextProtos:         []string{"http/1.1"},
 		ServerName:         "example.test",
 	})
-	defer client.Close()
+	defer closeTest(client)
 
 	if err := client.Handshake(); err != nil {
 		t.Fatalf("client Handshake() error = %v", err)
@@ -387,8 +388,8 @@ func TestCleanupWebsiteConnRemovesShadowState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer closeTest(server)
+	defer closeTest(client)
 
 	buffered := newBufferedConn(testTLSStateConn{
 		Conn:  server,
@@ -423,7 +424,7 @@ func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	tlsListener := tls.NewListener(base, &tls.Config{
 		Certificates: []tls.Certificate{newTestCertificate(t)},
@@ -443,7 +444,7 @@ func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
 			serverErr <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 		serverErr <- nil
 	}()
 
@@ -455,7 +456,7 @@ func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
 		NextProtos:         []string{"http/1.1"},
 		ServerName:         "example.test",
 	})
-	defer client.Close()
+	defer closeTest(client)
 
 	if err := client.Handshake(); err != nil {
 		t.Fatalf("client Handshake() error = %v", err)
@@ -481,7 +482,7 @@ func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
 func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
-	defer destination.Close()
+	defer closeTest(destination)
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
@@ -501,7 +502,7 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 			destDone <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 
 		line, err := bufio.NewReader(conn).ReadString('\n')
 		if err != nil {
@@ -514,7 +515,7 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 	}()
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 	tlsListener := tls.NewListener(base, &tls.Config{
 		Certificates: []tls.Certificate{newTestCertificate(t)},
 		NextProtos:   []string{"h2", "http/1.1"},
@@ -555,13 +556,13 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client.Close()
+	defer closeTest(client)
 
 	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
 	if err != nil {
 		t.Fatalf("CreateProxy() error = %v", err)
 	}
-	defer proxyConn.Close()
+	defer closeTest(proxyConn)
 
 	if _, err := io.WriteString(proxyConn, "hello through anytls over tls\n"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
@@ -592,7 +593,7 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
-	defer destination.Close()
+	defer closeTest(destination)
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
@@ -612,7 +613,7 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 			destDone <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 
 		line, err := bufio.NewReader(conn).ReadString('\n')
 		if err != nil {
@@ -625,7 +626,7 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 	}()
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 	tlsListener := tls.NewListener(base, &tls.Config{
 		Certificates: []tls.Certificate{newTestCertificate(t)},
 		NextProtos:   []string{"h2", "http/1.1"},
@@ -660,13 +661,13 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client.Close()
+	defer closeTest(client)
 
 	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
 	if err != nil {
 		t.Fatalf("CreateProxy() error = %v", err)
 	}
-	defer proxyConn.Close()
+	defer closeTest(proxyConn)
 
 	if _, err := io.WriteString(proxyConn, "hello through anytls over tls\n"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
@@ -688,7 +689,7 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 func TestAnyTLSEndToEndProxy(t *testing.T) {
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
-	defer destination.Close()
+	defer closeTest(destination)
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
 		if address != destinationAddress {
@@ -706,7 +707,7 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 			destDone <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 
 		line, err := bufio.NewReader(conn).ReadString('\n')
 		if err != nil {
@@ -719,7 +720,7 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 	}()
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	wrapped := wrapper.WrapListener(base)
 	acceptCtx, cancelAccept := context.WithCancel(context.Background())
@@ -741,13 +742,13 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client.Close()
+	defer closeTest(client)
 
 	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
 	if err != nil {
 		t.Fatalf("CreateProxy() error = %v", err)
 	}
-	defer proxyConn.Close()
+	defer closeTest(proxyConn)
 
 	if _, err := io.WriteString(proxyConn, "hello through anytls\n"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
@@ -768,8 +769,8 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 
 func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
 	serverPacketConn, handlerPacketConn := newPacketPipe()
-	defer serverPacketConn.Close()
-	defer handlerPacketConn.Close()
+	defer closeTest(serverPacketConn)
+	defer closeTest(handlerPacketConn)
 
 	udpDone := make(chan error, 1)
 	go func() {
@@ -788,7 +789,7 @@ func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
 		return handlerPacketConn, nil
 	}
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	wrapped := wrapper.WrapListener(base)
 	acceptCtx, cancelAccept := context.WithCancel(context.Background())
@@ -810,7 +811,7 @@ func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client.Close()
+	defer closeTest(client)
 
 	uotClient := &uot.Client{
 		Dialer:  anyTLSTestDialer{client: client},
@@ -821,7 +822,7 @@ func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialContext() error = %v", err)
 	}
-	defer uotConn.Close()
+	defer closeTest(uotConn)
 
 	if _, err := io.WriteString(uotConn, "hello over udp\n"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
@@ -842,8 +843,8 @@ func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
 
 func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 	serverPacketConn, handlerPacketConn := newPacketPipe()
-	defer serverPacketConn.Close()
-	defer handlerPacketConn.Close()
+	defer closeTest(serverPacketConn)
+	defer closeTest(handlerPacketConn)
 
 	firstDone := make(chan error, 1)
 	secondDone := make(chan error, 1)
@@ -873,7 +874,7 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 		return handlerPacketConn, nil
 	}
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 
 	go acceptLoop(context.Background(), wrapper.WrapListener(base))
 
@@ -892,7 +893,7 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client.Close()
+	defer closeTest(client)
 
 	uotClient := &uot.Client{
 		Dialer:  anyTLSTestDialer{client: client},
@@ -903,7 +904,7 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenPacket() error = %v", err)
 	}
-	defer packetConn.Close()
+	defer closeTest(packetConn)
 
 	dest1 := M.ParseSocksaddr("1.1.1.1:53")
 	dest2 := M.ParseSocksaddr("8.8.8.8:53")
@@ -979,6 +980,134 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 }
 
+func TestUnmarshalCaddyfileAllowsFallbackFalse(t *testing.T) {
+	dispenser := caddyfile.NewTestDispenser(`
+	anytls {
+		fallback false
+		user alice secret
+	}
+	`)
+
+	var wrapper ListenerWrapper
+	if err := wrapper.UnmarshalCaddyfile(dispenser); err != nil {
+		t.Fatalf("UnmarshalCaddyfile() error = %v", err)
+	}
+	wrapper.logger = zap.NewNop()
+	wrapper.registry = newSessionRegistry()
+	if err := wrapper.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+
+	if wrapper.Fallback {
+		t.Fatal("Fallback = true, want false")
+	}
+}
+
+func TestUnmarshalJSONDefaults(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantFallback bool
+		wantEnabled  bool
+	}{
+		{
+			name:         "omitted booleans use documented defaults",
+			input:        `{"users":[{"name":"alice","password":"secret"}]}`,
+			wantFallback: true,
+			wantEnabled:  true,
+		},
+		{
+			name:         "explicit false values are preserved",
+			input:        `{"fallback":false,"users":[{"name":"alice","password":"secret","enabled":false}]}`,
+			wantFallback: false,
+			wantEnabled:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var wrapper ListenerWrapper
+			if err := json.Unmarshal([]byte(tt.input), &wrapper); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if wrapper.Fallback != tt.wantFallback {
+				t.Fatalf("Fallback = %v, want %v", wrapper.Fallback, tt.wantFallback)
+			}
+			if len(wrapper.Users) != 1 {
+				t.Fatalf("len(Users) = %d, want 1", len(wrapper.Users))
+			}
+			if wrapper.Users[0].Enabled != tt.wantEnabled {
+				t.Fatalf("Users[0].Enabled = %v, want %v", wrapper.Users[0].Enabled, tt.wantEnabled)
+			}
+		})
+	}
+}
+
+func TestValidateStreamDestinationRejectsResolvedPrivateAddress(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.resolveFunc = func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		if host != "internal.example.test" {
+			t.Fatalf("resolve host = %q, want internal.example.test", host)
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	handler := &directTCPHandler{config: wrapper}
+
+	_, err := handler.validateStreamDestination(context.Background(), M.ParseSocksaddr("internal.example.test:443"))
+	if !errors.Is(err, errPrivateDestinationDenied) {
+		t.Fatalf("validateStreamDestination() error = %v, want private destination denied", err)
+	}
+}
+
+func TestValidateStreamDestinationResolvesPublicAddress(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.resolveFunc = func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+	handler := &directTCPHandler{config: wrapper}
+
+	got, err := handler.validateStreamDestination(context.Background(), M.ParseSocksaddr("example.test:443"))
+	if err != nil {
+		t.Fatalf("validateStreamDestination() error = %v", err)
+	}
+	if got.String() != "93.184.216.34:443" {
+		t.Fatalf("resolved destination = %s, want 93.184.216.34:443", got.String())
+	}
+}
+
+func TestPreparePacketDestinationRejectsResolvedPrivateAddress(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.resolveFunc = func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("10.0.0.10")}, nil
+	}
+	handler := &directTCPHandler{config: wrapper}
+
+	_, err := handler.preparePacketDestination(context.Background(), M.ParseSocksaddr("dns.internal.test:53"))
+	if !errors.Is(err, errPrivateDestinationDenied) {
+		t.Fatalf("preparePacketDestination() error = %v, want private destination denied", err)
+	}
+}
+
+func TestIdleTimeoutConnRefreshesDeadlines(t *testing.T) {
+	base := &deadlineConn{}
+	conn := newIdleTimeoutConn(base, time.Minute)
+
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if base.writeDeadline.IsZero() {
+		t.Fatal("write deadline was not refreshed")
+	}
+
+	buf := []byte{0}
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if base.readDeadline.IsZero() {
+		t.Fatal("read deadline was not refreshed")
+	}
+}
+
 func TestReloadStyleUserDisableStopsNewAnyTLSDetection(t *testing.T) {
 	enabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	disabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: false}}, true)
@@ -1011,7 +1140,7 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	})
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 	wrapped := fallbackWrapper.WrapListener(base)
 	serverConn, client := net.Pipe()
 	base.enqueue(serverConn)
@@ -1038,7 +1167,7 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	logger2 := zap.New(core2)
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
-	defer destination.Close()
+	defer closeTest(destination)
 	proxyWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	proxyWrapper.logger = logger2
 	proxyWrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
@@ -1067,7 +1196,7 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 			destDone <- err
 			return
 		}
-		defer conn.Close()
+		defer closeTest(conn)
 		line, err := bufio.NewReader(conn).ReadString('\n')
 		if err != nil {
 			destDone <- err
@@ -1078,7 +1207,7 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	}()
 
 	base2 := newChanListener()
-	defer base2.Close()
+	defer closeTest(base2)
 	go acceptLoop(context.Background(), proxyWrapper.WrapListener(base2))
 
 	client2, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
@@ -1096,13 +1225,13 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client2.Close()
+	defer closeTest(client2)
 
 	proxyConn, err := client2.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
 	if err != nil {
 		t.Fatalf("CreateProxy() error = %v", err)
 	}
-	defer proxyConn.Close()
+	defer closeTest(proxyConn)
 	if _, err := io.WriteString(proxyConn, "ping\n"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
 	}
@@ -1131,7 +1260,7 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
-	defer destination.Close()
+	defer closeTest(destination)
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.logger = logger
@@ -1164,7 +1293,7 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 	}()
 
 	base := newChanListener()
-	defer base.Close()
+	defer closeTest(base)
 	go acceptLoop(context.Background(), wrapper.WrapListener(base))
 
 	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
@@ -1182,13 +1311,13 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
-	defer client.Close()
+	defer closeTest(client)
 
 	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
 	if err != nil {
 		t.Fatalf("CreateProxy() error = %v", err)
 	}
-	defer proxyConn.Close()
+	defer closeTest(proxyConn)
 
 	if _, err := io.WriteString(proxyConn, "hold-open\n"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
@@ -1197,7 +1326,7 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 	var destConn net.Conn
 	select {
 	case destConn = <-destReady:
-		defer destConn.Close()
+		defer closeTest(destConn)
 	case <-time.After(time.Second):
 		t.Fatal("destination connection was not established")
 	}
@@ -1377,6 +1506,10 @@ func waitForCondition(timeout time.Duration, fn func() bool) bool {
 	return fn()
 }
 
+func closeTest(closer io.Closer) {
+	_ = closer.Close()
+}
+
 type chanListener struct {
 	connCh chan net.Conn
 	once   sync.Once
@@ -1463,6 +1596,50 @@ type dummyAddr string
 func (a dummyAddr) Network() string { return "memory" }
 
 func (a dummyAddr) String() string { return string(a) }
+
+type deadlineConn struct {
+	readDeadline  time.Time
+	writeDeadline time.Time
+}
+
+func (c *deadlineConn) Read(p []byte) (int, error) {
+	if len(p) > 0 {
+		p[0] = 'x'
+	}
+	return 1, nil
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (c *deadlineConn) Close() error {
+	return nil
+}
+
+func (c *deadlineConn) LocalAddr() net.Addr {
+	return dummyAddr("local")
+}
+
+func (c *deadlineConn) RemoteAddr() net.Addr {
+	return dummyAddr("remote")
+}
+
+func (c *deadlineConn) SetDeadline(t time.Time) error {
+	c.readDeadline = t
+	c.writeDeadline = t
+	return nil
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline = t
+	return nil
+}
+
+func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline = t
+	return nil
+}
 
 type packetPayload struct {
 	data []byte
