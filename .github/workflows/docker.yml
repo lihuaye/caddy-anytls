@@ -22,6 +22,9 @@ on:
       - "go.sum"
       - "**/*.go"
   workflow_dispatch:
+  schedule:
+    # Run the heavier race detector once daily at 04:00 Asia/Shanghai.
+    - cron: "0 20 * * *"
 
 env:
   REGISTRY: ghcr.io
@@ -45,6 +48,7 @@ jobs:
         run: go test ./...
 
       - name: Race test
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: go test -race ./...
 
       - name: Vet
