@@ -54,14 +54,10 @@ jobs:
         run: go mod verify
 
       - name: Staticcheck
-        uses: dominikh/staticcheck-action@v1.4.1
-        with:
-          version: "2026.1"
+        uses: dominikh/staticcheck-action@v1
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.12.2
 
   docker:
     runs-on: ubuntu-latest
