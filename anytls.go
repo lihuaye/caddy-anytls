@@ -12,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,7 +46,18 @@ type ListenerWrapper struct {
 	MaxConcurrent       int            `json:"max_concurrent,omitempty"`
 	Fallback            bool           `json:"fallback,omitempty"`
 	AllowPrivateTargets bool           `json:"allow_private_targets,omitempty"`
+	AllowCIDRs          []string       `json:"allow_cidrs,omitempty"`
+	DenyCIDRs           []string       `json:"deny_cidrs,omitempty"`
+	AllowPorts          []uint16       `json:"allow_ports,omitempty"`
+	DenyPorts           []uint16       `json:"deny_ports,omitempty"`
+	AllowDomains        []string       `json:"allow_domains,omitempty"`
+	DenyDomains         []string       `json:"deny_domains,omitempty"`
 	PaddingScheme       string         `json:"padding_scheme,omitempty"`
+	LogNodeInfo         bool           `json:"log_node_info,omitempty"`
+	NodeHosts           []string       `json:"node_hosts,omitempty"`
+	NodePort            uint16         `json:"node_port,omitempty"`
+	NodeSNI             string         `json:"node_sni,omitempty"`
+	NodeInsecure        bool           `json:"node_insecure,omitempty"`
 
 	logger           *zap.Logger
 	active           int64
@@ -99,7 +112,9 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	if lw.registry == nil {
 		lw.registry = newSessionRegistry()
 	}
-	if server, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && server != nil {
+	var server *caddyhttp.Server
+	if serverFromContext, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && serverFromContext != nil {
+		server = serverFromContext
 		server.RegisterConnContext(lw.websiteConnContext)
 		server.RegisterConnState(lw.cleanupWebsiteConn)
 	}
@@ -119,6 +134,7 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("create sing-anytls service: %w", err)
 	}
 	lw.service = service
+	lw.logNodeInfo(server)
 
 	return nil
 }
@@ -136,6 +152,16 @@ func (lw *ListenerWrapper) Validate() error {
 	}
 	if lw.ConnectTimeout < 0 {
 		return fmt.Errorf("connect_timeout must be non-negative")
+	}
+	for _, cidr := range append(append([]string{}, lw.AllowCIDRs...), lw.DenyCIDRs...) {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			return fmt.Errorf("invalid cidr %q: %w", cidr, err)
+		}
+	}
+	for _, domain := range append(append([]string{}, lw.AllowDomains...), lw.DenyDomains...) {
+		if domain == "" {
+			return fmt.Errorf("domain policy entry must not be empty")
+		}
 	}
 
 	seen := make([]string, 0, len(lw.Users))
@@ -218,11 +244,90 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			lw.AllowPrivateTargets = value
 
+		case "allow_cidr":
+			values := d.RemainingArgs()
+			if len(values) == 0 {
+				return d.ArgErr()
+			}
+			lw.AllowCIDRs = append(lw.AllowCIDRs, values...)
+
+		case "deny_cidr":
+			values := d.RemainingArgs()
+			if len(values) == 0 {
+				return d.ArgErr()
+			}
+			lw.DenyCIDRs = append(lw.DenyCIDRs, values...)
+
+		case "allow_port":
+			values, err := parsePortListDirective(d, "allow_port")
+			if err != nil {
+				return err
+			}
+			lw.AllowPorts = append(lw.AllowPorts, values...)
+
+		case "deny_port":
+			values, err := parsePortListDirective(d, "deny_port")
+			if err != nil {
+				return err
+			}
+			lw.DenyPorts = append(lw.DenyPorts, values...)
+
+		case "allow_domain":
+			values := d.RemainingArgs()
+			if len(values) == 0 {
+				return d.ArgErr()
+			}
+			lw.AllowDomains = append(lw.AllowDomains, values...)
+
+		case "deny_domain":
+			values := d.RemainingArgs()
+			if len(values) == 0 {
+				return d.ArgErr()
+			}
+			lw.DenyDomains = append(lw.DenyDomains, values...)
+
 		case "padding_scheme":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
 			lw.PaddingScheme = d.Val()
+
+		case "log_node_info":
+			value, err := parseBoolDirective(d, "log_node_info")
+			if err != nil {
+				return err
+			}
+			lw.LogNodeInfo = value
+
+		case "node_host":
+			values := d.RemainingArgs()
+			if len(values) == 0 {
+				return d.ArgErr()
+			}
+			lw.NodeHosts = append(lw.NodeHosts, values...)
+
+		case "node_port":
+			values, err := parsePortListDirective(d, "node_port")
+			if err != nil {
+				return err
+			}
+			if len(values) != 1 {
+				return d.Errf("node_port expects exactly one port")
+			}
+			lw.NodePort = values[0]
+
+		case "node_sni":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			lw.NodeSNI = d.Val()
+
+		case "node_insecure":
+			value, err := parseBoolDirective(d, "node_insecure")
+			if err != nil {
+				return err
+			}
+			lw.NodeInsecure = value
 
 		case "user":
 			args := d.RemainingArgs()
@@ -254,7 +359,18 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 		MaxConcurrent       int            `json:"max_concurrent,omitempty"`
 		Fallback            bool           `json:"fallback,omitempty"`
 		AllowPrivateTargets bool           `json:"allow_private_targets,omitempty"`
+		AllowCIDRs          []string       `json:"allow_cidrs,omitempty"`
+		DenyCIDRs           []string       `json:"deny_cidrs,omitempty"`
+		AllowPorts          []uint16       `json:"allow_ports,omitempty"`
+		DenyPorts           []uint16       `json:"deny_ports,omitempty"`
+		AllowDomains        []string       `json:"allow_domains,omitempty"`
+		DenyDomains         []string       `json:"deny_domains,omitempty"`
 		PaddingScheme       string         `json:"padding_scheme,omitempty"`
+		LogNodeInfo         bool           `json:"log_node_info,omitempty"`
+		NodeHosts           []string       `json:"node_hosts,omitempty"`
+		NodePort            uint16         `json:"node_port,omitempty"`
+		NodeSNI             string         `json:"node_sni,omitempty"`
+		NodeInsecure        bool           `json:"node_insecure,omitempty"`
 	}
 	if err := json.Unmarshal(data, &config); err != nil {
 		return err
@@ -266,7 +382,18 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 	lw.MaxConcurrent = config.MaxConcurrent
 	lw.Fallback = config.Fallback
 	lw.AllowPrivateTargets = config.AllowPrivateTargets
+	lw.AllowCIDRs = config.AllowCIDRs
+	lw.DenyCIDRs = config.DenyCIDRs
+	lw.AllowPorts = config.AllowPorts
+	lw.DenyPorts = config.DenyPorts
+	lw.AllowDomains = config.AllowDomains
+	lw.DenyDomains = config.DenyDomains
 	lw.PaddingScheme = config.PaddingScheme
+	lw.LogNodeInfo = config.LogNodeInfo
+	lw.NodeHosts = config.NodeHosts
+	lw.NodePort = config.NodePort
+	lw.NodeSNI = config.NodeSNI
+	lw.NodeInsecure = config.NodeInsecure
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -321,6 +448,156 @@ func (lw *ListenerWrapper) anyTLSUsers() []singanytls.User {
 	return users
 }
 
+func (lw *ListenerWrapper) logNodeInfo(server *caddyhttp.Server) {
+	if !lw.LogNodeInfo {
+		return
+	}
+
+	hosts := lw.nodeHosts(server)
+	if len(hosts) == 0 {
+		lw.logger.Warn("anytls node info requested but no node host found",
+			zap.String("event", "anytls_node"),
+			zap.String("reason", "missing_node_host"),
+		)
+		return
+	}
+
+	port := lw.nodePort(server)
+	for _, user := range lw.Users {
+		if !user.Enabled {
+			continue
+		}
+		for _, host := range hosts {
+			sni := lw.NodeSNI
+			if sni == "" {
+				sni = host
+			}
+			lw.logger.Info("anytls node available",
+				zap.String("event", "anytls_node"),
+				zap.String("user", user.Name),
+				zap.String("host", host),
+				zap.Uint16("port", port),
+				zap.String("sni", sni),
+				zap.Bool("insecure", lw.NodeInsecure),
+				zap.String("uri", anyTLSURI(user.Password, host, port, sni, lw.NodeInsecure)),
+			)
+		}
+	}
+}
+
+func (lw *ListenerWrapper) nodeHosts(server *caddyhttp.Server) []string {
+	var hosts []string
+	if len(lw.NodeHosts) > 0 {
+		hosts = append(hosts, lw.NodeHosts...)
+	} else {
+		hosts = append(hosts, inferNodeHosts(server)...)
+	}
+	return normalizeNodeHosts(hosts)
+}
+
+func (lw *ListenerWrapper) nodePort(server *caddyhttp.Server) uint16 {
+	if lw.NodePort != 0 {
+		return lw.NodePort
+	}
+	if server == nil {
+		return 443
+	}
+	for _, listen := range server.Listen {
+		if port, ok := portFromListenAddress(listen); ok {
+			return port
+		}
+	}
+	return 443
+}
+
+func inferNodeHosts(server *caddyhttp.Server) []string {
+	if server == nil {
+		return nil
+	}
+
+	var hosts []string
+	for _, route := range server.Routes {
+		for _, matcherSet := range route.MatcherSets {
+			for _, matcher := range matcherSet {
+				if hostMatcher, ok := matcher.(*caddyhttp.MatchHost); ok {
+					hosts = append(hosts, []string(*hostMatcher)...)
+				}
+			}
+		}
+		for _, matcherSet := range route.MatcherSetsRaw {
+			if rawHosts, ok := matcherSet["host"]; ok {
+				var hostMatcher caddyhttp.MatchHost
+				if err := json.Unmarshal(rawHosts, &hostMatcher); err == nil {
+					hosts = append(hosts, []string(hostMatcher)...)
+				}
+			}
+		}
+	}
+	return hosts
+}
+
+func normalizeNodeHosts(hosts []string) []string {
+	normalized := make([]string, 0, len(hosts))
+	seen := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		host = strings.TrimSpace(host)
+		if host == "" || strings.ContainsAny(host, "{*") {
+			continue
+		}
+		host = strings.Trim(host, "[]")
+		key := strings.ToLower(host)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, host)
+	}
+	return normalized
+}
+
+func portFromListenAddress(listen string) (uint16, bool) {
+	if strings.TrimSpace(listen) == "" {
+		return 0, false
+	}
+	if strings.Contains(listen, "/") {
+		return 0, false
+	}
+
+	_, portText, err := net.SplitHostPort(listen)
+	if err != nil {
+		portText = strings.TrimPrefix(listen, ":")
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return 0, false
+	}
+	return uint16(port), true
+}
+
+func anyTLSURI(password, host string, port uint16, sni string, insecure bool) string {
+	authorityHost := host
+	if addr, err := netip.ParseAddr(host); err == nil && addr.Is6() {
+		authorityHost = "[" + host + "]"
+	}
+	if port != 0 && port != 443 {
+		authorityHost = net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10))
+	}
+
+	values := url.Values{}
+	if sni != "" && sni != host {
+		values.Set("sni", sni)
+	}
+	if insecure {
+		values.Set("insecure", "1")
+	}
+
+	uri := "anytls://" + url.User(password).String() + "@" + authorityHost + "/"
+	if encoded := values.Encode(); encoded != "" {
+		uri += "?" + encoded
+	}
+	return uri
+}
+
 type directTCPHandler struct {
 	config *ListenerWrapper
 }
@@ -329,7 +606,25 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 	startedAt := time.Now()
 	connectionID := connectionIDFromContext(ctx)
 	h.config.updateSessionUser(connectionID, userFromContext(ctx))
+	inbound := newCountingConn(conn)
+	var outboundCounter *countingConn
 	closeOnce := N.OnceClose(func(err error) {
+		if outboundCounter != nil {
+			h.config.logger.Debug("anytls relay closed",
+				zap.Uint64("connection_id", connectionID),
+				zap.String("event", "anytls_relay"),
+				zap.String("outcome", "closed"),
+				zap.String("protocol", "tcp"),
+				zap.String("user", userFromContext(ctx)),
+				zap.String("source", source.String()),
+				zap.String("destination", destination.String()),
+				zap.Int64("bytes_from_client", inbound.BytesRead()),
+				zap.Int64("bytes_to_client", inbound.BytesWritten()),
+				zap.Int64("bytes_from_target", outboundCounter.BytesRead()),
+				zap.Int64("bytes_to_target", outboundCounter.BytesWritten()),
+				zap.Duration("duration", time.Since(startedAt)),
+			)
+		}
 		if onClose != nil {
 			onClose(err)
 		}
@@ -347,6 +642,7 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		_ = conn.Close()
 		return
 	}
+	outboundCounter = newCountingConn(outbound)
 
 	h.config.logger.Info("anytls connection established",
 		zap.Uint64("connection_id", connectionID),
@@ -358,7 +654,7 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		zap.String("destination", destination.String()),
 	)
 
-	relay(ctx, conn, outbound, closeOnce)
+	relay(ctx, inbound, outboundCounter, closeOnce)
 }
 
 func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, closeOnce N.CloseHandlerFunc) {
@@ -394,7 +690,7 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 }
 
 func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	resolvedDestination, err := h.validateStreamDestination(ctx, destination)
+	resolvedDestinations, err := h.validateStreamDestination(ctx, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -402,10 +698,20 @@ func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksa
 	dialer := &net.Dialer{
 		Timeout: time.Duration(h.config.ConnectTimeout),
 	}
-	if h.config.dialFunc != nil {
-		return h.config.dialFunc(ctx, "tcp", resolvedDestination.String())
+	var errs []error
+	for _, resolvedDestination := range resolvedDestinations {
+		var conn net.Conn
+		if h.config.dialFunc != nil {
+			conn, err = h.config.dialFunc(ctx, "tcp", resolvedDestination.String())
+		} else {
+			conn, err = dialer.DialContext(ctx, "tcp", resolvedDestination.String())
+		}
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, fmt.Errorf("dial %s: %w", resolvedDestination.String(), err))
 	}
-	return dialer.DialContext(ctx, "tcp", resolvedDestination.String())
+	return nil, errors.Join(errs...)
 }
 
 func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {
@@ -437,51 +743,57 @@ func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.C
 	}
 }
 
-func (h *directTCPHandler) validateStreamDestination(ctx context.Context, destination M.Socksaddr) (M.Socksaddr, error) {
+func (h *directTCPHandler) validateStreamDestination(ctx context.Context, destination M.Socksaddr) ([]M.Socksaddr, error) {
 	if !destination.IsValid() || destination.Port == 0 {
-		return M.Socksaddr{}, fmt.Errorf("%w", errInvalidDestination)
+		return nil, fmt.Errorf("%w", errInvalidDestination)
 	}
-	if h.config.AllowPrivateTargets {
-		return destination, nil
+	if err := h.validateNameAndPortPolicy(destination); err != nil {
+		return nil, err
 	}
-	resolvedDestination, err := h.resolveDestination(ctx, destination)
-	if err != nil {
-		return M.Socksaddr{}, err
+	if h.config.AllowPrivateTargets && !h.needsCIDRPolicy() {
+		return []M.Socksaddr{destination}, nil
 	}
-	if isPrivateDestination(resolvedDestination) {
-		return M.Socksaddr{}, fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
-	}
-	return resolvedDestination, nil
-}
-
-func (h *directTCPHandler) validatePacketDestination(ctx context.Context, destination M.Socksaddr) (M.Socksaddr, error) {
-	if !destination.IsValid() || destination.Port == 0 {
-		return M.Socksaddr{}, fmt.Errorf("%w", errInvalidDestination)
-	}
-	if h.config.AllowPrivateTargets {
-		return destination, nil
-	}
-	resolvedDestination, err := h.resolveDestination(ctx, destination)
-	if err != nil {
-		return M.Socksaddr{}, err
-	}
-	if isPrivateDestination(resolvedDestination) {
-		return M.Socksaddr{}, fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
-	}
-	return resolvedDestination, nil
-}
-
-func (h *directTCPHandler) preparePacketDestination(ctx context.Context, destination M.Socksaddr) (net.Addr, error) {
-	resolvedDestination, err := h.validatePacketDestination(ctx, destination)
+	resolvedDestinations, err := h.resolveDestination(ctx, destination)
 	if err != nil {
 		return nil, err
 	}
-	return resolveUDPAddr(resolvedDestination)
+	if err := h.validateResolvedDestinationPolicy(destination, resolvedDestinations); err != nil {
+		return nil, err
+	}
+	return resolvedDestinations, nil
 }
 
-func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M.Socksaddr) (M.Socksaddr, error) {
+func (h *directTCPHandler) validatePacketDestination(ctx context.Context, destination M.Socksaddr) ([]M.Socksaddr, error) {
+	if !destination.IsValid() || destination.Port == 0 {
+		return nil, fmt.Errorf("%w", errInvalidDestination)
+	}
+	if err := h.validateNameAndPortPolicy(destination); err != nil {
+		return nil, err
+	}
+	if h.config.AllowPrivateTargets && !h.needsCIDRPolicy() {
+		return []M.Socksaddr{destination}, nil
+	}
+	resolvedDestinations, err := h.resolveDestination(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.validateResolvedDestinationPolicy(destination, resolvedDestinations); err != nil {
+		return nil, err
+	}
+	return resolvedDestinations, nil
+}
+
+func (h *directTCPHandler) preparePacketDestination(ctx context.Context, destination M.Socksaddr) (net.Addr, error) {
+	resolvedDestinations, err := h.validatePacketDestination(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	return resolveUDPAddr(resolvedDestinations[0])
+}
+
+func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M.Socksaddr) ([]M.Socksaddr, error) {
 	if destination.Addr.IsValid() {
-		return destination, nil
+		return []M.Socksaddr{destination}, nil
 	}
 	resolveFunc := h.config.resolveFunc
 	if resolveFunc == nil {
@@ -490,18 +802,95 @@ func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M
 	}
 	addresses, err := resolveFunc(ctx, "ip", destination.Fqdn)
 	if err != nil {
-		return M.Socksaddr{}, fmt.Errorf("resolve destination %s: %w", destination.String(), err)
+		return nil, fmt.Errorf("resolve destination %s: %w", destination.String(), err)
 	}
 	if len(addresses) == 0 {
-		return M.Socksaddr{}, fmt.Errorf("resolve destination %s: no addresses", destination.String())
+		return nil, fmt.Errorf("resolve destination %s: no addresses", destination.String())
 	}
+	destinations := make([]M.Socksaddr, 0, len(addresses))
 	for _, addr := range addresses {
-		resolved := M.Socksaddr{Addr: addr, Port: destination.Port}
-		if isPrivateDestination(resolved) {
-			return M.Socksaddr{}, fmt.Errorf("%w: %s resolves to %s", errPrivateDestinationDenied, destination.String(), addr.String())
+		destinations = append(destinations, M.Socksaddr{Addr: addr, Port: destination.Port})
+	}
+	return destinations, nil
+}
+
+func (h *directTCPHandler) validateNameAndPortPolicy(destination M.Socksaddr) error {
+	if containsPort(h.config.DenyPorts, destination.Port) {
+		return fmt.Errorf("%w: %s", errDestinationPolicyDenied, destination.String())
+	}
+	if len(h.config.AllowPorts) > 0 && !containsPort(h.config.AllowPorts, destination.Port) {
+		return fmt.Errorf("%w: %s", errDestinationPolicyDenied, destination.String())
+	}
+	if destination.Fqdn == "" {
+		return nil
+	}
+	if matchesDomainPolicy(h.config.DenyDomains, destination.Fqdn) {
+		return fmt.Errorf("%w: %s", errDestinationPolicyDenied, destination.String())
+	}
+	if len(h.config.AllowDomains) > 0 && !matchesDomainPolicy(h.config.AllowDomains, destination.Fqdn) {
+		return fmt.Errorf("%w: %s", errDestinationPolicyDenied, destination.String())
+	}
+	return nil
+}
+
+func (h *directTCPHandler) needsCIDRPolicy() bool {
+	return len(h.config.AllowCIDRs) > 0 || len(h.config.DenyCIDRs) > 0 || !h.config.AllowPrivateTargets
+}
+
+func (h *directTCPHandler) validateResolvedDestinationPolicy(original M.Socksaddr, destinations []M.Socksaddr) error {
+	for _, destination := range destinations {
+		if matchesCIDRPolicy(h.config.DenyCIDRs, destination.Addr) {
+			return fmt.Errorf("%w: %s resolves to %s", errDestinationPolicyDenied, original.String(), destination.Addr.String())
 		}
 	}
-	return M.Socksaddr{Addr: addresses[0], Port: destination.Port}, nil
+	for _, destination := range destinations {
+		private := isPrivateDestination(destination)
+		allowedCIDR := matchesCIDRPolicy(h.config.AllowCIDRs, destination.Addr)
+		if private && !h.config.AllowPrivateTargets && !allowedCIDR {
+			return fmt.Errorf("%w: %s resolves to %s", errPrivateDestinationDenied, original.String(), destination.Addr.String())
+		}
+		if len(h.config.AllowCIDRs) > 0 && !allowedCIDR {
+			return fmt.Errorf("%w: %s resolves to %s", errDestinationPolicyDenied, original.String(), destination.Addr.String())
+		}
+	}
+	return nil
+}
+
+func containsPort(ports []uint16, port uint16) bool {
+	return slices.Contains(ports, port)
+}
+
+func matchesCIDRPolicy(cidrs []string, addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, cidr := range cidrs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesDomainPolicy(patterns []string, domain string) bool {
+	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
+	for _, pattern := range patterns {
+		pattern = strings.TrimSuffix(strings.ToLower(pattern), ".")
+		switch {
+		case pattern == domain:
+			return true
+		case strings.HasPrefix(pattern, ".") && strings.HasSuffix(domain, pattern):
+			return true
+		case strings.HasPrefix(pattern, "*.") && strings.HasSuffix(domain, strings.TrimPrefix(pattern, "*")):
+			return true
+		}
+	}
+	return false
 }
 
 func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, err error) {
@@ -600,6 +989,7 @@ func (lw *ListenerWrapper) cleanupWebsiteConn(conn net.Conn, state http.ConnStat
 var (
 	errInvalidDestination       = errors.New("invalid destination")
 	errPrivateDestinationDenied = errors.New("private destination denied")
+	errDestinationPolicyDenied  = errors.New("destination policy denied")
 	errInvalidUDPOverTCPRequest = errors.New("invalid udp over tcp request")
 	errUnsupportedUDPOverTCP    = errors.New("unsupported udp over tcp")
 )
@@ -627,6 +1017,8 @@ func dialFailureReason(err error) string {
 		return "invalid_destination"
 	case errors.Is(err, errPrivateDestinationDenied):
 		return "private_target_denied"
+	case errors.Is(err, errDestinationPolicyDenied):
+		return "destination_policy_denied"
 	case errors.Is(err, errInvalidUDPOverTCPRequest):
 		return "invalid_udp_over_tcp_request"
 	case errors.Is(err, errUnsupportedUDPOverTCP):
@@ -656,4 +1048,20 @@ func parseBoolDirective(d *caddyfile.Dispenser, name string) (bool, error) {
 		return false, d.Errf("parsing %s boolean: %v", name, err)
 	}
 	return value, nil
+}
+
+func parsePortListDirective(d *caddyfile.Dispenser, name string) ([]uint16, error) {
+	args := d.RemainingArgs()
+	if len(args) == 0 {
+		return nil, d.ArgErr()
+	}
+	ports := make([]uint16, 0, len(args))
+	for _, arg := range args {
+		value, err := strconv.ParseUint(arg, 10, 16)
+		if err != nil || value == 0 {
+			return nil, d.Errf("parsing %s port %q: must be between 1 and 65535", name, arg)
+		}
+		ports = append(ports, uint16(value))
+	}
+	return ports, nil
 }

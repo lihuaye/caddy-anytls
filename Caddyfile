@@ -3,6 +3,8 @@
 		listener_wrappers {
 			anytls {
 				user device-1 change-this-password
+				log_node_info true
+				node_host example.com
 			}
 		}
 	}

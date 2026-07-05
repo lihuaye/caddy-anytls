@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -301,6 +302,26 @@ func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestHTTP2PrefaceFallsBackWithoutFullAnyTLSPeek(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapped := &wrappedListener{config: wrapper}
+
+	server, client := net.Pipe()
+	defer closeTest(server)
+	defer closeTest(client)
+	go func() {
+		_, _ = client.Write([]byte(http2.ClientPreface))
+	}()
+
+	decision, err := wrapped.classifyBufferedConn(newBufferedConn(server))
+	if err != nil {
+		t.Fatalf("classifyBufferedConn() error = %v", err)
+	}
+	if decision != DecisionFallback {
+		t.Fatalf("decision = %v, want fallback", decision)
 	}
 }
 
@@ -948,6 +969,17 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		max_concurrent 64
 		fallback true
 		allow_private_targets false
+		allow_cidr 10.0.0.0/8
+		deny_cidr 127.0.0.0/8
+		allow_port 443 8443
+		deny_port 25
+		allow_domain example.com .example.org
+		deny_domain blocked.example
+		log_node_info true
+		node_host example.com alt.example.com
+		node_port 8443
+		node_sni real.example.com
+		node_insecure true
 		user alice secret
 	}
 	`)
@@ -975,8 +1007,140 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	if wrapper.AllowPrivateTargets {
 		t.Fatal("AllowPrivateTargets = true, want false")
 	}
+	if strings.Join(wrapper.AllowCIDRs, ",") != "10.0.0.0/8" {
+		t.Fatalf("AllowCIDRs = %v, want 10.0.0.0/8", wrapper.AllowCIDRs)
+	}
+	if strings.Join(wrapper.DenyCIDRs, ",") != "127.0.0.0/8" {
+		t.Fatalf("DenyCIDRs = %v, want 127.0.0.0/8", wrapper.DenyCIDRs)
+	}
+	if !slices.Equal(wrapper.AllowPorts, []uint16{443, 8443}) {
+		t.Fatalf("AllowPorts = %v, want [443 8443]", wrapper.AllowPorts)
+	}
+	if !slices.Equal(wrapper.DenyPorts, []uint16{25}) {
+		t.Fatalf("DenyPorts = %v, want [25]", wrapper.DenyPorts)
+	}
+	if strings.Join(wrapper.AllowDomains, ",") != "example.com,.example.org" {
+		t.Fatalf("AllowDomains = %v, want example.com and .example.org", wrapper.AllowDomains)
+	}
+	if strings.Join(wrapper.DenyDomains, ",") != "blocked.example" {
+		t.Fatalf("DenyDomains = %v, want blocked.example", wrapper.DenyDomains)
+	}
+	if !wrapper.LogNodeInfo {
+		t.Fatal("LogNodeInfo = false, want true")
+	}
+	if strings.Join(wrapper.NodeHosts, ",") != "example.com,alt.example.com" {
+		t.Fatalf("NodeHosts = %v, want example.com and alt.example.com", wrapper.NodeHosts)
+	}
+	if wrapper.NodePort != 8443 {
+		t.Fatalf("NodePort = %d, want 8443", wrapper.NodePort)
+	}
+	if wrapper.NodeSNI != "real.example.com" {
+		t.Fatalf("NodeSNI = %q, want real.example.com", wrapper.NodeSNI)
+	}
+	if !wrapper.NodeInsecure {
+		t.Fatal("NodeInsecure = false, want true")
+	}
 	if len(wrapper.Users) != 1 || wrapper.Users[0].Name != "alice" || wrapper.Users[0].Password != "secret" || !wrapper.Users[0].Enabled {
 		t.Fatalf("Users = %#v, want one enabled user", wrapper.Users)
+	}
+}
+
+func TestAnyTLSURI(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		host     string
+		port     uint16
+		sni      string
+		insecure bool
+		want     string
+	}{
+		{
+			name:     "default port omits port",
+			password: "secret",
+			host:     "example.com",
+			port:     443,
+			sni:      "example.com",
+			want:     "anytls://secret@example.com/",
+		},
+		{
+			name:     "encodes password and query",
+			password: "change:this password",
+			host:     "example.com",
+			port:     8443,
+			sni:      "real.example.com",
+			insecure: true,
+			want:     "anytls://change%3Athis%20password@example.com:8443/?insecure=1&sni=real.example.com",
+		},
+		{
+			name:     "brackets ipv6 host",
+			password: "secret",
+			host:     "2001:db8::1",
+			port:     443,
+			want:     "anytls://secret@[2001:db8::1]/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := anyTLSURI(tt.password, tt.host, tt.port, tt.sni, tt.insecure)
+			if got != tt.want {
+				t.Fatalf("anyTLSURI() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLogNodeInfo(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	wrapper := &ListenerWrapper{
+		Users: []User{
+			{Name: "alice", Password: "change:this password", Enabled: true},
+			{Name: "bob", Password: "disabled", Enabled: false},
+		},
+		LogNodeInfo:  true,
+		NodeHosts:    []string{"example.com"},
+		NodePort:     8443,
+		NodeSNI:      "real.example.com",
+		NodeInsecure: true,
+		logger:       zap.New(core),
+	}
+
+	wrapper.logNodeInfo(nil)
+
+	entries := logs.FilterMessage("anytls node available").All()
+	if len(entries) != 1 {
+		t.Fatalf("node log count = %d, want 1", len(entries))
+	}
+
+	fields := entries[0].ContextMap()
+	if fields["event"] != "anytls_node" {
+		t.Fatalf("event = %v, want anytls_node", fields["event"])
+	}
+	if fields["user"] != "alice" {
+		t.Fatalf("user = %v, want alice", fields["user"])
+	}
+	wantURI := "anytls://change%3Athis%20password@example.com:8443/?insecure=1&sni=real.example.com"
+	if fields["uri"] != wantURI {
+		t.Fatalf("uri = %v, want %s", fields["uri"], wantURI)
+	}
+}
+
+func TestInferNodeHosts(t *testing.T) {
+	server := &caddyhttp.Server{
+		Routes: caddyhttp.RouteList{
+			{
+				MatcherSetsRaw: caddyhttp.RawMatcherSets{
+					{"host": json.RawMessage(`["example.com","*.wild.example","{placeholder}.example"]`)},
+				},
+			},
+		},
+	}
+
+	wrapper := &ListenerWrapper{}
+	hosts := wrapper.nodeHosts(server)
+	if !slices.Equal(hosts, []string{"example.com"}) {
+		t.Fatalf("nodeHosts() = %v, want [example.com]", hosts)
 	}
 }
 
@@ -1018,7 +1182,7 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 		},
 		{
 			name:         "explicit false values are preserved",
-			input:        `{"fallback":false,"users":[{"name":"alice","password":"secret","enabled":false}]}`,
+			input:        `{"fallback":false,"allow_cidrs":["10.0.0.0/8"],"deny_cidrs":["127.0.0.0/8"],"allow_ports":[443],"deny_ports":[25],"allow_domains":["example.com"],"deny_domains":["blocked.example"],"users":[{"name":"alice","password":"secret","enabled":false}]}`,
 			wantFallback: false,
 			wantEnabled:  false,
 		},
@@ -1038,6 +1202,17 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 			}
 			if wrapper.Users[0].Enabled != tt.wantEnabled {
 				t.Fatalf("Users[0].Enabled = %v, want %v", wrapper.Users[0].Enabled, tt.wantEnabled)
+			}
+			if tt.name == "explicit false values are preserved" {
+				if strings.Join(wrapper.AllowCIDRs, ",") != "10.0.0.0/8" || strings.Join(wrapper.DenyCIDRs, ",") != "127.0.0.0/8" {
+					t.Fatalf("cidr policies were not decoded: allow=%v deny=%v", wrapper.AllowCIDRs, wrapper.DenyCIDRs)
+				}
+				if !slices.Equal(wrapper.AllowPorts, []uint16{443}) || !slices.Equal(wrapper.DenyPorts, []uint16{25}) {
+					t.Fatalf("port policies were not decoded: allow=%v deny=%v", wrapper.AllowPorts, wrapper.DenyPorts)
+				}
+				if strings.Join(wrapper.AllowDomains, ",") != "example.com" || strings.Join(wrapper.DenyDomains, ",") != "blocked.example" {
+					t.Fatalf("domain policies were not decoded: allow=%v deny=%v", wrapper.AllowDomains, wrapper.DenyDomains)
+				}
 			}
 		})
 	}
@@ -1070,8 +1245,124 @@ func TestValidateStreamDestinationResolvesPublicAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validateStreamDestination() error = %v", err)
 	}
-	if got.String() != "93.184.216.34:443" {
-		t.Fatalf("resolved destination = %s, want 93.184.216.34:443", got.String())
+	if len(got) != 1 || got[0].String() != "93.184.216.34:443" {
+		t.Fatalf("resolved destination = %v, want 93.184.216.34:443", got)
+	}
+}
+
+func TestDialContextFallsBackAcrossResolvedAddresses(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.resolveFunc = func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return []netip.Addr{
+			netip.MustParseAddr("93.184.216.34"),
+			netip.MustParseAddr("93.184.216.35"),
+		}, nil
+	}
+	var dialed []string
+	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		dialed = append(dialed, address)
+		if address == "93.184.216.34:443" {
+			return nil, errors.New("first address failed")
+		}
+		server, client := net.Pipe()
+		closeTest(server)
+		return client, nil
+	}
+	handler := &directTCPHandler{config: wrapper}
+
+	conn, err := handler.dialContext(context.Background(), M.ParseSocksaddr("example.test:443"))
+	if err != nil {
+		t.Fatalf("dialContext() error = %v", err)
+	}
+	closeTest(conn)
+	if strings.Join(dialed, ",") != "93.184.216.34:443,93.184.216.35:443" {
+		t.Fatalf("dialed = %v, want both resolved addresses", dialed)
+	}
+}
+
+func TestDestinationPolicies(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*ListenerWrapper)
+		destination string
+		resolved    string
+		wantErr     error
+	}{
+		{
+			name: "deny port",
+			mutate: func(wrapper *ListenerWrapper) {
+				wrapper.DenyPorts = []uint16{25}
+			},
+			destination: "example.test:25",
+			resolved:    "93.184.216.34",
+			wantErr:     errDestinationPolicyDenied,
+		},
+		{
+			name: "allow port excludes other ports",
+			mutate: func(wrapper *ListenerWrapper) {
+				wrapper.AllowPorts = []uint16{443}
+			},
+			destination: "example.test:80",
+			resolved:    "93.184.216.34",
+			wantErr:     errDestinationPolicyDenied,
+		},
+		{
+			name: "deny domain",
+			mutate: func(wrapper *ListenerWrapper) {
+				wrapper.DenyDomains = []string{".blocked.test"}
+			},
+			destination: "api.blocked.test:443",
+			resolved:    "93.184.216.34",
+			wantErr:     errDestinationPolicyDenied,
+		},
+		{
+			name: "allow domain excludes other domains",
+			mutate: func(wrapper *ListenerWrapper) {
+				wrapper.AllowDomains = []string{"allowed.test"}
+			},
+			destination: "blocked.test:443",
+			resolved:    "93.184.216.34",
+			wantErr:     errDestinationPolicyDenied,
+		},
+		{
+			name: "deny cidr",
+			mutate: func(wrapper *ListenerWrapper) {
+				wrapper.DenyCIDRs = []string{"93.184.216.0/24"}
+			},
+			destination: "example.test:443",
+			resolved:    "93.184.216.34",
+			wantErr:     errDestinationPolicyDenied,
+		},
+		{
+			name: "allow cidr can explicitly permit private target",
+			mutate: func(wrapper *ListenerWrapper) {
+				wrapper.AllowCIDRs = []string{"10.0.0.0/8"}
+			},
+			destination: "internal.test:443",
+			resolved:    "10.0.0.10",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+			tt.mutate(wrapper)
+			wrapper.resolveFunc = func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr(tt.resolved)}, nil
+			}
+			handler := &directTCPHandler{config: wrapper}
+
+			_, err := handler.validateStreamDestination(context.Background(), M.ParseSocksaddr(tt.destination))
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("validateStreamDestination() error = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("validateStreamDestination() error = %v, want %v", err, tt.wantErr)
+			}
+		})
 	}
 }
 

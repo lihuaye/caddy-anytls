@@ -32,6 +32,17 @@ docker build -t caddy-anytls:local .
 
 如需调整超时、并发、回落或私网目标策略，可参考 [examples.md](examples.md) 与 [README.md](../README.md)。
 
+默认 [Caddyfile](../Caddyfile) 开启了 `log_node_info true`，容器启动或重载成功后会在 Caddy 日志中输出 `event=anytls_node`。其中 `uri` 字段就是当前启用用户可用的 AnyTLS 节点 URI。URI 中包含密码，请控制日志访问权限。
+
+启动前也可以在仓库根目录离线生成客户端节点信息：
+
+```sh
+ANYTLS_SERVER=example.com \
+ANYTLS_PASSWORD=replace-with-strong-password \
+ANYTLS_NAME=phone-1 \
+scripts/print-node-info.sh
+```
+
 ## Docker Compose
 
 通过以下命令启动本地环境：
@@ -69,6 +80,7 @@ docker compose up -d --build
 - 非 Pull Request 事件会登录 GHCR 并推送镜像
 - 发布目标架构为 `linux/amd64` 和 `linux/arm64`
 - 使用 GitHub Actions 缓存加速 `buildx` 构建
+- Docker 构建前会先执行 Go 测试、race 测试、`go vet`、`go mod verify`、`staticcheck` 和 `golangci-lint`
 
 ## 镜像地址与标签
 

@@ -44,13 +44,24 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Race test
+        run: go test -race ./...
+
       - name: Vet
         run: go vet ./...
+
+      - name: Verify modules
+        run: go mod verify
 
       - name: Staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
-          version: latest
+          version: "2026.1"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
 
   docker:
     runs-on: ubuntu-latest

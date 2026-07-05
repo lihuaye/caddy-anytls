@@ -94,6 +94,7 @@ func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *buffere
 			zap.String("remote", rawConn.RemoteAddr().String()),
 			zap.String("event", "fallback"),
 			zap.String("outcome", "fallback"),
+			zap.String("reason", "website_protocol"),
 		)
 		conn, err := fallbackConn(buffered)
 		if err != nil {
@@ -153,11 +154,92 @@ func (wl *wrappedListener) handshakeTLSConn(conn *tls.Conn) error {
 }
 
 func (wl *wrappedListener) classifyBufferedConn(conn *bufferedConn) (Decision, error) {
+	if decision, ok, err := wl.classifyWebsiteFastPath(conn); ok || err != nil {
+		return decision, err
+	}
+
 	preview, err := conn.Peek(32, time.Duration(wl.config.ProbeTimeout))
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		return DecisionFallback, fmt.Errorf("peek first bytes: %w", err)
 	}
 	return wl.classifyPreview(preview)
+}
+
+func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (Decision, bool, error) {
+	first, err := conn.Peek(1, time.Duration(wl.config.ProbeTimeout))
+	if err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			return DecisionFallback, true, nil
+		}
+		return DecisionFallback, false, fmt.Errorf("peek first byte: %w", err)
+	}
+	switch first[0] {
+	case 'P':
+		preview, err := conn.Peek(4, time.Duration(wl.config.ProbeTimeout))
+		if err != nil {
+			return DecisionFallback, false, fmt.Errorf("peek website prefix: %w", err)
+		}
+		switch string(preview) {
+		case "POST":
+			return wl.matchWebsitePrefix(conn, "POST ")
+		case "PRI ":
+			return wl.matchWebsitePrefix(conn, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+		}
+		return DecisionFallback, false, nil
+	case 'G':
+		return wl.matchWebsitePrefix(conn, "GET ")
+	case 'H':
+		return wl.matchWebsitePrefix(conn, "HEAD ")
+	case 'O':
+		return wl.matchWebsitePrefix(conn, "OPTIONS ")
+	case 'D':
+		return wl.matchWebsitePrefix(conn, "DELETE ")
+	case 'T':
+		return wl.matchWebsitePrefix(conn, "TRACE ")
+	case 'C':
+		return wl.matchWebsitePrefix(conn, "CONNECT ")
+	case 'R':
+		return wl.matchWebsitePrefix(conn, "REPORT ")
+	case 'M':
+		return wl.matchWebsitePrefix(conn, "MKCOL ")
+	case 'N':
+		return wl.matchWebsitePrefix(conn, "NOTIFY ")
+	case 'S':
+		preview, err := conn.Peek(3, time.Duration(wl.config.ProbeTimeout))
+		if err != nil {
+			return DecisionFallback, false, fmt.Errorf("peek website prefix: %w", err)
+		}
+		switch string(preview) {
+		case "SUB":
+			return wl.matchWebsitePrefix(conn, "SUBSCRIBE ")
+		case "SEA":
+			return wl.matchWebsitePrefix(conn, "SEARCH ")
+		}
+		return DecisionFallback, false, nil
+	case 'U':
+		return wl.matchWebsitePrefix(conn, "UNSUBSCRIBE ")
+	case 'L':
+		return wl.matchWebsitePrefix(conn, "LOCK ")
+	case 'A':
+		return wl.matchWebsitePrefix(conn, "ACL ")
+	case 'B':
+		return wl.matchWebsitePrefix(conn, "BIND ")
+	}
+	return DecisionFallback, false, nil
+}
+
+func (wl *wrappedListener) matchWebsitePrefix(conn *bufferedConn, prefix string) (Decision, bool, error) {
+	preview, err := conn.Peek(len(prefix), time.Duration(wl.config.ProbeTimeout))
+	if err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			return DecisionFallback, true, nil
+		}
+		return DecisionFallback, false, fmt.Errorf("peek website prefix: %w", err)
+	}
+	if string(preview) == prefix {
+		return DecisionFallback, true, nil
+	}
+	return DecisionFallback, false, nil
 }
 
 func (wl *wrappedListener) classifyPreview(preview []byte) (Decision, error) {
