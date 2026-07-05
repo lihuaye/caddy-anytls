@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 )
 
@@ -24,9 +25,9 @@ type Detector interface {
 }
 
 var (
-	errShortPreview     = fmt.Errorf("short preview")
-	errUnknownUserHash  = fmt.Errorf("unknown user hash")
-	errDisabledUserHash = fmt.Errorf("disabled user")
+	errShortPreview     = errors.New("short preview")
+	errUnknownUserHash  = errors.New("unknown user hash")
+	errDisabledUserHash = errors.New("disabled user")
 )
 
 // PasswordHashDetector matches the leading AnyTLS password hash used by the

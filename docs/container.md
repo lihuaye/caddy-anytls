@@ -34,15 +34,6 @@ docker build -t caddy-anytls:local .
 
 默认 [Caddyfile](../Caddyfile) 开启了 `log_node_info true`，容器启动或重载成功后会在 Caddy 日志中输出 `event=anytls_node`。其中 `uri` 字段就是当前启用用户可用的 AnyTLS 节点 URI。URI 中包含密码，请控制日志访问权限。
 
-启动前也可以在仓库根目录离线生成客户端节点信息：
-
-```sh
-ANYTLS_SERVER=example.com \
-ANYTLS_PASSWORD=replace-with-strong-password \
-ANYTLS_NAME=phone-1 \
-scripts/print-node-info.sh
-```
-
 ## Docker Compose
 
 通过以下命令启动本地环境：

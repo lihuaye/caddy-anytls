@@ -184,28 +184,6 @@ anytls://replace-with-strong-password@example.com/
 
 如果没有配置 `node_host`，模块会尝试从 Caddy 站点的 host matcher 推断具体域名；通配符或 placeholder host 不会被用于节点 URI。
 
-仓库内脚本仍可用于离线生成常见客户端配置片段：
-
-```sh
-ANYTLS_SERVER=example.com \
-ANYTLS_PASSWORD=replace-with-strong-password \
-ANYTLS_NAME=phone-1 \
-scripts/print-node-info.sh
-```
-
-输出包含上游 AnyTLS URI、Mihomo、Surfboard 和 sing-box outbound 配置。URI 格式遵循 `anytls-go` 文档：`anytls://[auth@]hostname[:port]/?[key=value]&...`。
-
-可用环境变量：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `ANYTLS_SERVER` | `example.com` | 服务端域名或地址 |
-| `ANYTLS_PORT` | `443` | 服务端端口 |
-| `ANYTLS_NAME` | `caddy-anytls` | 节点名称 |
-| `ANYTLS_PASSWORD` | `change-this-password` | AnyTLS 用户密码 |
-| `ANYTLS_SNI` | 同 `ANYTLS_SERVER` | TLS SNI |
-| `ANYTLS_SKIP_CERT_VERIFY` | `false` | 是否跳过证书校验 |
-
 URI 规则：
 
 - 密码放在 URI auth 位置，特殊字符会进行百分号编码

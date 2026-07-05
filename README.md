@@ -1,42 +1,28 @@
 # caddy-anytls
 
-`caddy-anytls` 是一个 Caddy listener wrapper，用来把 AnyTLS 接入现有的 Caddy `443` 入口。
+`caddy-anytls` 是一个 Caddy listener wrapper，用来把 AnyTLS 接入现有的 Caddy HTTPS 入口。
 
-它适合已经用 Caddy 托管 HTTPS 站点，但不想再单独维护 AnyTLS 服务端、证书和额外监听端口的场景。
+它适合已经用 Caddy 托管站点，但不想再维护单独 AnyTLS 服务端、证书和额外监听端口的部署场景。Caddy 继续负责监听、TLS、证书申请和站点路由；本模块只在 TLS 解密后、HTTP 解析前识别 AnyTLS 流量，并把非 AnyTLS 流量交还给网站链路。
 
 ## 核心能力
 
 - 网站和 AnyTLS 共用同一个 `443` 入口
-- TLS 握手、证书申请和续期继续由 Caddy 负责
+- 完全复用 Caddy 自动 HTTPS 和证书生命周期
 - AnyTLS 识别发生在 TLS 解密之后、HTTP 解析之前
-- 非 AnyTLS 流量无损回落到原网站链路
-- HTTP/1 与 HTTP/2 网站首包快速回落，减少普通请求探测等待
+- 非 AnyTLS 流量无损回落到原网站
 - 支持多用户、基础 TCP 转发和 `UDP over TCP v2`
 - 默认拒绝私网目标，并支持端口、域名和 CIDR 出站策略
-- 输出结构化审计日志
-
-## 工作方式
-
-```text
-client
-  -> Caddy :443
-    -> TLS handshake
-      -> caddy-anytls 探测 TLS 后首包
-        -> AnyTLS：认证并转发
-        -> 非 AnyTLS：交还给网站处理链路
-```
-
-这个项目不是独立代理程序。它不自己管理证书，不替代 Caddy 的 HTTP 站点能力，只负责在 Caddy listener 层完成 AnyTLS 接入、识别、策略校验和转发。
+- 输出结构化审计日志，可选输出当前可用节点 URI
 
 ## 快速开始
 
-### 1. 构建带模块的 Caddy
+### 方式一：使用预构建 Docker 镜像
 
 ```sh
-xcaddy build --with github.com/evaneonf/caddy-anytls=.
+docker pull ghcr.io/evaneonf/caddy-anytls:latest
 ```
 
-### 2. 准备 Caddyfile
+准备 `Caddyfile`：
 
 ```caddyfile
 {
@@ -61,34 +47,36 @@ example.com {
 - `example.com`：替换为真实域名
 - `replace-with-strong-password`：替换为强密码
 
-Caddy 启动或重载成功后会在日志里输出 `event=anytls_node` 的节点信息，其中包含当前启用用户可用的 AnyTLS URI。URI 格式遵循 `anytls-go` 文档：`anytls://[auth@]hostname[:port]/?[key=value]&...`，常用参数包括 `sni` 和 `insecure`。
-
-### 3. 离线生成客户端节点信息
+启动容器：
 
 ```sh
-ANYTLS_SERVER=example.com \
-ANYTLS_PASSWORD=replace-with-strong-password \
-ANYTLS_NAME=phone-1 \
-scripts/print-node-info.sh
+docker run -d --name caddy-anytls \
+  -p 80:80 \
+  -p 443:443 \
+  -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  -v caddy_data:/data \
+  -v caddy_config:/config \
+  --restart unless-stopped \
+  ghcr.io/evaneonf/caddy-anytls:latest
 ```
 
-脚本会输出上游 AnyTLS URI，以及 Mihomo、Surfboard 和 sing-box outbound 配置片段。URI 格式遵循 `anytls-go` 文档：`anytls://[auth@]hostname[:port]/?[key=value]&...`，常用参数包括 `sni` 和 `insecure`。
-
-## Docker
-
-可以直接使用预构建镜像：
+查看节点 URI：
 
 ```sh
-docker pull ghcr.io/evaneonf/caddy-anytls:latest
+docker logs caddy-anytls 2>&1 | grep anytls_node
 ```
 
-本地构建镜像：
+`log_node_info true` 会把包含密码的 AnyTLS URI 写入 Caddy 日志。只有在日志访问权限可控时才建议开启。
+
+### 方式二：本地构建
+
+使用 `xcaddy` 构建带模块的 Caddy：
 
 ```sh
-docker build -t caddy-anytls:local .
+xcaddy build --with github.com/evaneonf/caddy-anytls=.
 ```
 
-使用 Compose 启动：
+仓库也提供了本地构建用的 Compose 配置：
 
 ```sh
 docker compose up -d --build
@@ -100,7 +88,41 @@ docker compose up -d --build
 - `caddy_data -> /data`
 - `caddy_config -> /config`
 
-## 配置
+## 工作方式
+
+```text
+client
+  -> Caddy :443
+    -> TLS handshake
+      -> caddy-anytls 探测 TLS 后首包
+        -> AnyTLS：认证并转发
+        -> 非 AnyTLS：交还给网站处理链路
+```
+
+这个项目不是独立代理程序，不自己管理证书，也不替代 Caddy 的 HTTP 站点能力。
+
+## 节点信息
+
+Caddy 启动或重载成功后，如果开启 `log_node_info`，会输出 `event=anytls_node` 的结构化日志。每个启用用户、每个 `node_host` 会各输出一条，字段包含：
+
+- `user`
+- `host`
+- `port`
+- `sni`
+- `insecure`
+- `uri`
+
+示例 URI：
+
+```text
+anytls://replace-with-strong-password@example.com/
+```
+
+URI 格式遵循 AnyTLS 上游文档：`anytls://[auth@]hostname[:port]/?[key=value]&...`，常用参数包括 `sni` 和 `insecure`。密码会放在 URI auth 位置，特殊字符会进行百分号编码。
+
+如果没有配置 `node_host`，模块会尝试从 Caddy 站点的 host matcher 推断具体域名；通配符或 placeholder host 不会用于节点 URI。
+
+## 配置参考
 
 最小配置只需要一个站点域名和至少一个用户：
 
@@ -137,11 +159,10 @@ anytls {
 - 配置了 `allow_*` 后，未命中的目标会被拒绝
 - `allow_private_targets false` 时，域名会先解析再检查所有返回地址
 - `allow_cidr` 可以精确放行特定 CIDR，包括默认私网保护下的受控内网段
-- `log_node_info true` 会把用户密码编码进 URI 并写入日志，只应在你能控制日志访问权限时开启
 
-更多示例见 [docs/examples.md](docs/examples.md)。
+更多配置示例见 [docs/examples.md](docs/examples.md)。
 
-## 当前行为
+## 运行行为
 
 - 普通 HTTPS 请求照常进入网站
 - AnyTLS 客户端连接会在 TLS 后被模块接管
@@ -170,7 +191,7 @@ anytls {
 - `bytes_from_target`
 - `bytes_to_target`
 
-典型事件包括认证成功、网站 fallback、禁用用户拒绝、策略拒绝、私网目标拒绝、relay 关闭和配置卸载导致的会话终止。
+典型事件包括认证成功、网站 fallback、禁用用户拒绝、策略拒绝、私网目标拒绝、relay 关闭、节点 URI 输出和配置卸载导致的会话终止。
 
 ## 文档
 
