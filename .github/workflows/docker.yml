@@ -58,7 +58,7 @@ jobs:
         run: go mod verify
 
       - name: Staticcheck
-        uses: dominikh/staticcheck-action@v1
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
