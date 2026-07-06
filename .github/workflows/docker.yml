@@ -45,6 +45,27 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Check Caddy Docker version
+        run: |
+          set -euo pipefail
+
+          module_version="$(go list -m -f '{{ .Version }}' github.com/caddyserver/caddy/v2)"
+          builder_version="$(sed -n 's/^FROM caddy:\([0-9][^- ]*\)-builder AS builder$/\1/p' Dockerfile)"
+          runtime_version="$(sed -n 's/^FROM caddy:\([0-9][^ ]*\)$/\1/p' Dockerfile)"
+
+          if [ -z "$builder_version" ] || [ -z "$runtime_version" ]; then
+            echo "Could not parse Caddy image versions from Dockerfile" >&2
+            exit 1
+          fi
+          if [ "$builder_version" != "$runtime_version" ]; then
+            echo "Caddy builder image ${builder_version} does not match runtime image ${runtime_version}" >&2
+            exit 1
+          fi
+          if [ "$module_version" != "v${builder_version}" ]; then
+            echo "Dockerfile Caddy image ${builder_version} does not match go.mod ${module_version}" >&2
+            exit 1
+          fi
+
       - name: Test
         run: go test ./...
 

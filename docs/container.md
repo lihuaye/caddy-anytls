@@ -14,9 +14,10 @@ docker build -t caddy-anytls:local .
 
 当前镜像构建流程分为两个阶段：
 
-- 构建阶段基于 `caddy:2.10.2-builder`
+- 构建阶段基于 [Dockerfile](../Dockerfile) 中的 `caddy:<version>-builder`
 - 通过 `xcaddy` 将当前仓库模块编译进 `caddy`
-- 运行阶段基于 `caddy:2.10.2`
+- 运行阶段基于 [Dockerfile](../Dockerfile) 中的 `caddy:<version>`
+- Caddy 镜像版本应与 [go.mod](../go.mod) 中的 `github.com/caddyserver/caddy/v2` 保持一致，CI 会校验这一点
 
 ## 本地运行
 
@@ -61,17 +62,19 @@ docker compose up -d --build
 - 向 `main` 分支推送相关代码变更
 - 推送匹配 `v*` 的 Git tag
 - 手动触发 `workflow_dispatch`
+- 每日定时运行
 - 提交涉及容器或 Go 代码的 Pull Request
 
 ### 发布行为
 
 工作流的发布策略如下：
 
-- Pull Request 只执行构建验证，不推送镜像
-- 非 Pull Request 事件会登录 GHCR 并推送镜像
+- Pull Request 与 `main` push 只执行轻量代码检查，不构建或推送镜像
+- 定时运行会执行完整检查，并且仅在 Docker 或 Go 输入有变化时推送 `main` 镜像
+- 手动触发会执行完整检查并推送镜像
+- `v*` tag 会执行完整检查、推送版本镜像，并更新 `latest`
 - 发布目标架构为 `linux/amd64` 和 `linux/arm64`
 - 使用 GitHub Actions 缓存加速 `buildx` 构建
-- Docker 构建前会先执行 Go 测试、race 测试、`go vet`、`go mod verify`、`staticcheck` 和 `golangci-lint`
 
 ## 镜像地址与标签
 
