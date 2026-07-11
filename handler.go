@@ -149,19 +149,12 @@ func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksa
 	}
 	resolvedDestinations = interleaveAddressFamilies(resolvedDestinations)
 
-	dialer := &net.Dialer{}
 	results := make(chan dialResult)
 	dialCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	launchDial := func(resolvedDestination M.Socksaddr) {
 		go func() {
-			var conn net.Conn
-			var dialErr error
-			if h.config.dialFunc != nil {
-				conn, dialErr = h.config.dialFunc(dialCtx, "tcp", resolvedDestination.String())
-			} else {
-				conn, dialErr = dialer.DialContext(dialCtx, "tcp", resolvedDestination.String())
-			}
+			conn, dialErr := h.dialResolved(dialCtx, resolvedDestination.String())
 			if dialErr != nil {
 				dialErr = fmt.Errorf("dial %s: %w", resolvedDestination.String(), dialErr)
 			}
@@ -266,13 +259,33 @@ func reportHandshakeFailure(conn net.Conn, err error) {
 	}
 }
 
+func (h *directTCPHandler) dialResolved(ctx context.Context, address string) (net.Conn, error) {
+	if h.config.dialFunc != nil {
+		return h.config.dialFunc(ctx, "tcp", address)
+	}
+	if timeout := time.Duration(h.config.ConnectTimeout); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	return h.outbound().DialContext(ctx, "tcp", address)
+}
+
 func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {
 	if h.config.listenPacketFunc != nil {
 		return h.config.listenPacketFunc(ctx, "udp", "")
 	}
+	return h.outbound().ListenPacket(ctx, "udp", "")
+}
 
-	listenConfig := net.ListenConfig{}
-	return listenConfig.ListenPacket(ctx, "udp", "")
+// outbound returns the configured egress module, falling back to a direct
+// outbound when Provision has not run (for example in unit tests that build a
+// wrapper by hand).
+func (h *directTCPHandler) outbound() Outbound {
+	if h.config.outbound != nil {
+		return h.config.outbound
+	}
+	return &DirectOutbound{}
 }
 
 func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {

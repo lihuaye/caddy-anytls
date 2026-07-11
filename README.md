@@ -165,6 +165,7 @@ example.com {
 | `allow_cidr` / `deny_cidr` | 无 | 按解析后的目标 IP CIDR 放行或拒绝 |
 | `allow_port` / `deny_port` | 无 | 按目标端口放行或拒绝 |
 | `allow_domain` / `deny_domain` | 无 | 按域名或域名后缀放行或拒绝 |
+| `outbound <name> { ... }` | `direct` | 选择出站模块，决定认证后的目标流量从哪里发出 |
 
 策略规则：
 
@@ -184,6 +185,40 @@ example.com {
 | `node_port` | 从 server listen 推断，通常为 `443` | 节点端口 |
 | `node_sni` | 同 `node_host` | 节点 URI 中的 SNI |
 | `node_insecure` | `false` | 是否在节点 URI 中输出 `insecure=1` |
+
+## 出站 (outbound)
+
+认证通过后，目标流量默认由运行 Caddy 的这台机器直接发出（内置 `direct` 出站）。你也可以用 `outbound` 指令切换到其它出站模块，把出口流量转发到别处，例如经 WireGuard 隧道从另一台家宽服务器出站，用住宅 IP 出网。
+
+```caddyfile
+anytls {
+    user phone-1 replace-with-strong-password
+    outbound wireguard {
+        private_key     <base64 客户端私钥>
+        peer_public_key <base64 服务端公钥>
+        endpoint        home.example.com:51820
+        address         10.7.0.2
+        allowed_ips     0.0.0.0/0 ::/0
+        persistent_keepalive 25
+    }
+}
+```
+
+- 出站模块注册在 `caddy.listeners.anytls.outbounds` 命名空间下。
+- 内置 `direct` 无需配置，是不写 `outbound` 时的默认行为。
+- 目标策略（私网拒绝、CIDR/端口/域名规则）和域名解析仍在出站之前完成，出站模块只负责搬运字节。
+- 域名使用运行 Caddy 的宿主机 DNS 解析后再交给出站模块；当前不支持由远端出口或隧道内 DNS 解析目标域名。
+- WireGuard 出站是一个独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)，用户态实现（wireguard-go + netstack），无需内核模块、TUN 设备或 root。构建方式：
+
+```sh
+xcaddy build \
+    --with github.com/evaneonf/caddy-anytls \
+    --with github.com/lihuaye/caddy-wireguard
+```
+
+配置项、密钥生成和家宽侧准备见该仓库的 README。
+
+## 获取客户端 URI
 
 如需临时获取客户端 URI，可在现有 `listener_wrappers` 的 `anytls` 配置块中加入：
 

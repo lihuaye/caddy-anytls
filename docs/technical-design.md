@@ -196,6 +196,27 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 - TCP relay 关闭及字节计数
 - 配置卸载导致的会话终止
 
+## 出站扩展点
+
+出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。模块需实现 `Outbound` 接口（`DialContext` + `ListenPacket`，见 `outbound.go`）。未配置或配置为 `null` 时回退到内置 `direct` 出站（本地网络栈直连）。
+
+### 职责边界
+
+认证、目标策略校验（私网/端口/域名/CIDR）与**宿主机域名解析**全部由 wrapper 在调用出站之前完成——包括 `allow_private_targets` 开启且无 CIDR 规则的快速路径（该路径只跳过策略校验，不跳过解析）。因此出站模块只负责搬字节：`DialContext` 收到的 address 永远是已解析的 `ip:port`，绝不会是域名。这对基于 netstack 的隧道出站（如 WireGuard，其内部无法使用宿主机解析器）是必要保证。
+
+### 实现契约
+
+- 两个方法会被多个 handler goroutine 并发调用（每条 AnyTLS 连接一个），实现必须并发安全。
+- 返回的 `net.Conn` / `net.PacketConn` 由 relay 负责关闭；每次调用必须返回独立连接，不得返回共享或缓存的连接。
+- `ctx` 携带 `connect_timeout` 的截止时间与取消信号，建连期间必须遵守。
+- `ListenPacket` 返回的连接按非 connected 方式使用：relay 会用 `WriteTo` 发往任意已解析的 UDP 目标。
+
+### 生命周期
+
+出站模块的生命周期完全交给 Caddy 模块系统：经 `ctx.LoadModule` 加载并 Provision；配置卸载时 Caddy 先执行 wrapper 注册的清理函数（关闭活跃会话），再调用出站模块的 `Cleanup`，因此持有外部资源（如隧道）的出站在 `Cleanup` 时不会有仍在使用中的连接。
+
+参考实现：内置 `direct`（`outbound.go`）；外部 WireGuard 出站 `github.com/lihuaye/caddy-wireguard`。
+
 ## 已知约束
 
 当前设计中需要持续关注以下约束：

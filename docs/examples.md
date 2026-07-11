@@ -201,6 +201,53 @@ URI 规则：
 - `ANYTLS_SNI` 与服务端地址不同时会输出 `sni` 参数
 - `ANYTLS_SKIP_CERT_VERIFY=true` 时会输出 `insecure=1`
 
+## 出站转发到其它出口（WireGuard）
+
+默认情况下认证后的目标流量从运行 Caddy 的机器直接发出。若希望出口流量从另一台主机（例如家宽服务器）出网，可用 `outbound` 指令切换出站模块。
+
+先按同时包含主模块和 WireGuard 出站插件的方式构建（WireGuard 出站是独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)）：
+
+```sh
+xcaddy build \
+    --with github.com/evaneonf/caddy-anytls \
+    --with github.com/lihuaye/caddy-wireguard
+```
+
+再在 `anytls` 块中配置出站：
+
+```caddyfile
+{
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                user phone-1 replace-with-strong-password
+                outbound wireguard {
+                    private_key          <base64 客户端私钥>
+                    peer_public_key      <base64 服务端公钥>
+                    endpoint             home.example.com:51820
+                    address              10.7.0.2
+                    allowed_ips          0.0.0.0/0 ::/0
+                    persistent_keepalive 25
+                }
+            }
+        }
+    }
+}
+
+example.com {
+    respond "server is running"
+}
+```
+
+行为说明：
+
+- 入口（客户端到 `:443`）路径不受影响，隧道只承载认证后的出口流量
+- 目标策略与域名解析仍在出站之前完成
+- 域名由运行 Caddy 的宿主机解析；远端出口或隧道内 DNS 不参与目标域名解析
+- 不写 `outbound` 时使用内置 `direct`，等价于原有直连行为
+
+配置项、密钥生成和家宽侧准备见 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard) 的 README。
+
 ## 已知限制
 
 当前示例覆盖的是首版可用配置，范围仍然有限：
