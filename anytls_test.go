@@ -689,8 +689,9 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -800,8 +801,9 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -894,8 +896,9 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 	destination := newChanListener()
 	defer closeTest(destination)
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -1270,8 +1273,9 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	defer closeTest(destination)
 	proxyWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	proxyWrapper.logger = logger2
+	proxyWrapper.resolveFunc = resolveTestDomain
 	proxyWrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -1364,8 +1368,9 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.logger = logger
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()

@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,16 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+// testResolvedDestinationAddress is what fixtures expect their dialFunc to
+// receive for a :443 domain destination resolved through resolveTestDomain:
+// destinations are always resolved on the host before reaching the outbound,
+// even on the allow_private_targets fast path.
+const testResolvedDestinationAddress = "192.0.2.10:443"
+
+func resolveTestDomain(context.Context, string, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+}
 
 func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *ListenerWrapper {
 	t.Helper()
@@ -37,6 +48,7 @@ func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *Liste
 		PaddingScheme:       string(padding.DefaultPaddingScheme),
 		logger:              zap.NewNop(),
 		registry:            newSessionRegistry(),
+		outbound:            new(DirectOutbound),
 	}
 	wrapper.detector = NewPasswordHashDetector(wrapper.Users)
 

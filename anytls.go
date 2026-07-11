@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -56,7 +57,12 @@ type ListenerWrapper struct {
 	NodeSNI              string         `json:"node_sni,omitempty"`
 	NodeInsecure         bool           `json:"node_insecure,omitempty"`
 
+	// OutboundRaw selects the module used to reach AnyTLS targets. When empty
+	// the built-in "direct" outbound is used.
+	OutboundRaw json.RawMessage `json:"outbound,omitempty" caddy:"namespace=caddy.listeners.anytls.outbounds inline_key=dialer"`
+
 	logger            *zap.Logger
+	outbound          Outbound
 	active            int64
 	activeStreams     int64
 	connSeq           uint64
@@ -132,6 +138,24 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	})
 	if err := lw.compileCIDRPolicies(); err != nil {
 		return err
+	}
+
+	// A configured outbound is loaded only when the raw config is a real module
+	// object. An explicit JSON null (or an empty value) falls back to direct,
+	// matching the documented default.
+	if len(lw.OutboundRaw) > 0 && string(lw.OutboundRaw) != "null" {
+		mod, err := ctx.LoadModule(lw, "OutboundRaw")
+		if err != nil {
+			return fmt.Errorf("load outbound module: %w", err)
+		}
+		outbound, ok := mod.(Outbound)
+		if !ok {
+			return fmt.Errorf("configured outbound %T is not an anytls outbound", mod)
+		}
+		lw.outbound = outbound
+	}
+	if lw.outbound == nil {
+		lw.outbound = new(DirectOutbound)
 	}
 
 	lw.detector = NewPasswordHashDetector(lw.Users)
