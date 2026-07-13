@@ -134,6 +134,16 @@ func TestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "duplicate password",
+			config: &ListenerWrapper{
+				Users: []User{
+					{Name: "alice", Password: "secret"},
+					{Name: "bob", Password: "secret"},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "negative concurrency",
 			config: &ListenerWrapper{
 				MaxConcurrent: -1,
@@ -161,6 +171,82 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want nil", err)
 			}
 		})
+	}
+}
+
+func TestWrappedListenerDoesNotBlockAcceptOnSlowProbe(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.MaxPendingProbes = 2
+	base := newChanListener()
+	wrapped := wrapper.WrapListener(base)
+	defer closeTest(wrapped)
+
+	slowServer, slowClient := net.Pipe()
+	defer closeTest(slowClient)
+	base.enqueue(slowServer)
+
+	websiteServer, websiteClient := net.Pipe()
+	defer closeTest(websiteClient)
+	base.enqueue(websiteServer)
+	go func() {
+		_, _ = io.WriteString(websiteClient, "GET / HTTP/1.1\r\n")
+	}()
+
+	accepted := make(chan net.Conn, 1)
+	errs := make(chan error, 1)
+	go func() {
+		conn, err := wrapped.Accept()
+		if err != nil {
+			errs <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	select {
+	case conn := <-accepted:
+		defer closeTest(conn)
+		prefix := make([]byte, len("GET "))
+		if _, err := io.ReadFull(conn, prefix); err != nil {
+			t.Fatalf("ReadFull() error = %v", err)
+		}
+		if string(prefix) != "GET " {
+			t.Fatalf("accepted prefix = %q, want GET", prefix)
+		}
+	case err := <-errs:
+		t.Fatalf("Accept() error = %v", err)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("fast website connection was blocked behind slow probe")
+	}
+}
+
+func TestStreamLimits(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.MaxStreamsPerSession = 1
+	wrapper.MaxConcurrentStreams = 1
+	server, client := net.Pipe()
+	defer closeTest(server)
+	defer closeTest(client)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wrapper.registerSession(1, server, cancel)
+	defer wrapper.unregisterSession(1)
+
+	if !wrapper.acquireStream(1) {
+		t.Fatal("first stream was rejected")
+	}
+	if wrapper.acquireStream(1) {
+		t.Fatal("second stream exceeded per-session limit but was accepted")
+	}
+	wrapper.releaseStream(1)
+	if !wrapper.acquireStream(1) {
+		t.Fatal("stream slot was not released")
+	}
+	wrapper.releaseStream(1)
+
+	if wrapper.acquireStream(999) {
+		t.Fatal("stream for unknown session was accepted")
 	}
 }
 
@@ -947,23 +1033,69 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 	}
 }
 
-func TestIdleTimeoutConnRefreshesDeadlines(t *testing.T) {
+func TestIdleTimeoutConnPreservesExplicitDeadlines(t *testing.T) {
 	base := &deadlineConn{}
 	conn := newIdleTimeoutConn(base, time.Minute)
+	defer closeTest(conn)
+
+	writeDeadline := time.Now().Add(5 * time.Second)
+	if err := conn.SetWriteDeadline(writeDeadline); err != nil {
+		t.Fatalf("SetWriteDeadline() error = %v", err)
+	}
 
 	if _, err := conn.Write([]byte("x")); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
-	if base.writeDeadline.IsZero() {
-		t.Fatal("write deadline was not refreshed")
+	if !base.writeDeadline.Equal(writeDeadline) {
+		t.Fatalf("write deadline = %v, want preserved %v", base.writeDeadline, writeDeadline)
+	}
+}
+
+func TestIdleTimeoutConnTreatsWritesAsActivity(t *testing.T) {
+	server, client := net.Pipe()
+	defer closeTest(client)
+	conn := newIdleTimeoutConn(server, 40*time.Millisecond)
+	defer closeTest(conn)
+	serverReadDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		_, err := conn.Read(buffer)
+		serverReadDone <- err
+	}()
+
+	for range 4 {
+		readDone := make(chan error, 1)
+		go func() {
+			buffer := make([]byte, 1)
+			_, err := client.Read(buffer)
+			readDone <- err
+		}()
+		if _, err := conn.Write([]byte("x")); err != nil {
+			t.Fatalf("Write() error = %v", err)
+		}
+		if err := <-readDone; err != nil {
+			t.Fatalf("client Read() error = %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	buf := []byte{0}
-	if _, err := conn.Read(buf); err != nil {
-		t.Fatalf("Read() error = %v", err)
+	readDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		_, err := client.Read(buffer)
+		readDone <- err
+	}()
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatalf("connection closed despite continuous write activity: %v", err)
 	}
-	if base.readDeadline.IsZero() {
-		t.Fatal("read deadline was not refreshed")
+	if err := <-readDone; err != nil {
+		t.Fatalf("client Read() error = %v", err)
+	}
+	if _, err := client.Write([]byte("y")); err != nil {
+		t.Fatalf("client Write() error = %v", err)
+	}
+	if err := <-serverReadDone; err != nil {
+		t.Fatalf("blocked Read() expired despite write activity: %v", err)
 	}
 }
 

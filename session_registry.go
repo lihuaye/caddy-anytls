@@ -15,10 +15,11 @@ type sessionRegistry struct {
 }
 
 type activeSession struct {
-	cancel    context.CancelFunc
-	conn      net.Conn
-	startedAt time.Time
-	user      string
+	cancel        context.CancelFunc
+	conn          net.Conn
+	startedAt     time.Time
+	user          string
+	activeStreams int
 }
 
 func newSessionRegistry() *sessionRegistry {
@@ -57,6 +58,28 @@ func (lw *ListenerWrapper) activeSessionCount() int {
 	lw.registry.mu.Lock()
 	defer lw.registry.mu.Unlock()
 	return len(lw.registry.sessions)
+}
+
+func (lw *ListenerWrapper) acquireSessionStream(connectionID uint64) bool {
+	lw.registry.mu.Lock()
+	defer lw.registry.mu.Unlock()
+	session, ok := lw.registry.sessions[connectionID]
+	if !ok {
+		return false
+	}
+	if lw.MaxStreamsPerSession > 0 && session.activeStreams >= lw.MaxStreamsPerSession {
+		return false
+	}
+	session.activeStreams++
+	return true
+}
+
+func (lw *ListenerWrapper) releaseSessionStream(connectionID uint64) {
+	lw.registry.mu.Lock()
+	defer lw.registry.mu.Unlock()
+	if session, ok := lw.registry.sessions[connectionID]; ok && session.activeStreams > 0 {
+		session.activeStreams--
+	}
 }
 
 func (lw *ListenerWrapper) closeActiveSessions(reason string) {

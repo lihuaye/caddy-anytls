@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -15,53 +16,145 @@ import (
 
 type wrappedListener struct {
 	net.Listener
-	config *ListenerWrapper
+	config      *ListenerWrapper
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	done        chan struct{}
+	ready       chan net.Conn
+	probeSlots  chan struct{}
+	terminalMu  sync.Mutex
+	terminalErr error
+}
+
+func newWrappedListener(listener net.Listener, config *ListenerWrapper) *wrappedListener {
+	maxPending := config.MaxPendingProbes
+	if maxPending <= 0 {
+		maxPending = 256
+	}
+	return &wrappedListener{
+		Listener:   listener,
+		config:     config,
+		done:       make(chan struct{}),
+		ready:      make(chan net.Conn),
+		probeSlots: make(chan struct{}, maxPending),
+	}
 }
 
 func (wl *wrappedListener) Accept() (net.Conn, error) {
+	wl.startOnce.Do(func() { go wl.acceptLoop() })
+	select {
+	case conn := <-wl.ready:
+		return conn, nil
+	case <-wl.done:
+		return nil, wl.getTerminalError()
+	}
+}
+
+func (wl *wrappedListener) Close() error {
+	err := wl.Listener.Close()
+	wl.stop(net.ErrClosed)
+	return err
+}
+
+func (wl *wrappedListener) acceptLoop() {
 	for {
+		select {
+		case wl.probeSlots <- struct{}{}:
+		case <-wl.done:
+			return
+		}
+
 		conn, err := wl.Listener.Accept()
 		if err != nil {
-			return nil, fmt.Errorf("accept connection: %w", err)
-		}
-		connectionID := wl.config.nextConnectionID()
-
-		if tlsConn, ok := conn.(*tls.Conn); ok {
-			if err := wl.handshakeTLSConn(tlsConn); err != nil {
-				wl.config.logger.Warn("connection rejected during anytls probe",
-					zap.Uint64("connection_id", connectionID),
-					zap.String("remote", conn.RemoteAddr().String()),
-					zap.String("event", "anytls_probe"),
-					zap.String("outcome", "rejected"),
-					zap.String("reason", "tls_handshake_failed"),
-					zap.Error(err),
-				)
-				_ = conn.Close()
-				continue
+			<-wl.probeSlots
+			select {
+			case <-wl.done:
+				return
+			default:
+				wl.stop(fmt.Errorf("accept connection: %w", err))
+				return
 			}
-			buffered := newBufferedConn(tlsConn)
-			websiteConn, handled, err := wl.routeBufferedConn(conn, buffered, connectionID, wl.config.prepareWebsiteConn)
-			if err != nil {
-				return nil, err
-			}
-			if handled {
-				continue
-			}
-			return websiteConn, nil
 		}
 
-		buffered := newBufferedConn(conn)
-		websiteConn, handled, err := wl.routeBufferedConn(conn, buffered, connectionID, func(conn *bufferedConn) (net.Conn, error) {
-			return conn, nil
-		})
-		if err != nil {
+		go wl.processAcceptedConn(conn)
+	}
+}
+
+func (wl *wrappedListener) processAcceptedConn(conn net.Conn) {
+	defer func() { <-wl.probeSlots }()
+	connectionID := wl.config.nextConnectionID()
+
+	websiteConn, err := wl.classifyAcceptedConn(conn, connectionID)
+	if err != nil {
+		wl.config.logger.Warn("connection routing failed",
+			zap.Uint64("connection_id", connectionID),
+			zap.String("remote", conn.RemoteAddr().String()),
+			zap.String("event", "anytls_probe"),
+			zap.String("outcome", "error"),
+			zap.Error(err),
+		)
+		_ = conn.Close()
+		return
+	}
+	if websiteConn == nil {
+		return
+	}
+
+	select {
+	case wl.ready <- websiteConn:
+	case <-wl.done:
+		_ = websiteConn.Close()
+	}
+}
+
+func (wl *wrappedListener) classifyAcceptedConn(conn net.Conn, connectionID uint64) (net.Conn, error) {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if err := wl.handshakeTLSConn(tlsConn); err != nil {
+			wl.config.logger.Debug("connection rejected during anytls probe",
+				zap.Uint64("connection_id", connectionID),
+				zap.String("remote", conn.RemoteAddr().String()),
+				zap.String("event", "anytls_probe"),
+				zap.String("outcome", "rejected"),
+				zap.String("reason", "tls_handshake_failed"),
+				zap.Error(err),
+			)
+			_ = conn.Close()
+			return nil, nil
+		}
+		buffered := newBufferedConn(tlsConn)
+		websiteConn, handled, err := wl.routeBufferedConn(conn, buffered, connectionID, wl.config.prepareWebsiteConn)
+		if err != nil || handled {
 			return nil, err
-		}
-		if handled {
-			continue
 		}
 		return websiteConn, nil
 	}
+
+	buffered := newBufferedConn(conn)
+	websiteConn, handled, err := wl.routeBufferedConn(conn, buffered, connectionID, func(conn *bufferedConn) (net.Conn, error) {
+		return conn, nil
+	})
+	if err != nil || handled {
+		return nil, err
+	}
+	return websiteConn, nil
+}
+
+func (wl *wrappedListener) stop(err error) {
+	wl.stopOnce.Do(func() {
+		wl.terminalMu.Lock()
+		wl.terminalErr = err
+		wl.terminalMu.Unlock()
+		close(wl.done)
+	})
+}
+
+func (wl *wrappedListener) getTerminalError() error {
+	wl.terminalMu.Lock()
+	defer wl.terminalMu.Unlock()
+	if wl.terminalErr == nil {
+		return net.ErrClosed
+	}
+	return wl.terminalErr
 }
 
 func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *bufferedConn, connectionID uint64, fallbackConn func(*bufferedConn) (net.Conn, error)) (net.Conn, bool, error) {
@@ -305,25 +398,76 @@ func (wl *wrappedListener) serveAnyTLS(conn net.Conn, connectionID uint64) {
 
 type idleTimeoutConn struct {
 	net.Conn
-	timeout time.Duration
+	timeout      time.Duration
+	mu           sync.Mutex
+	timer        *time.Timer
+	closed       bool
+	lastActivity time.Time
 }
 
 func newIdleTimeoutConn(conn net.Conn, timeout time.Duration) net.Conn {
 	if timeout <= 0 {
 		return conn
 	}
-	return &idleTimeoutConn{
-		Conn:    conn,
-		timeout: timeout,
+	connWithTimeout := &idleTimeoutConn{
+		Conn:         conn,
+		timeout:      timeout,
+		lastActivity: time.Now(),
 	}
+	connWithTimeout.timer = time.AfterFunc(timeout, connWithTimeout.expire)
+	return connWithTimeout
 }
 
 func (c *idleTimeoutConn) Read(p []byte) (int, error) {
-	_ = c.SetReadDeadline(time.Now().Add(c.timeout))
-	return c.Conn.Read(p)
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.touch()
+	}
+	return n, err
 }
 
 func (c *idleTimeoutConn) Write(p []byte) (int, error) {
-	_ = c.SetWriteDeadline(time.Now().Add(c.timeout))
-	return c.Conn.Write(p)
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idleTimeoutConn) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	c.closed = true
+	c.timer.Stop()
+	c.mu.Unlock()
+	return c.Conn.Close()
+}
+
+func (c *idleTimeoutConn) touch() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.lastActivity = time.Now()
+		c.timer.Reset(c.timeout)
+	}
+}
+
+func (c *idleTimeoutConn) expire() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	idleFor := time.Since(c.lastActivity)
+	if idleFor < c.timeout {
+		c.timer.Reset(c.timeout - idleFor)
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.mu.Unlock()
+	_ = c.Conn.Close()
 }

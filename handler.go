@@ -17,14 +17,39 @@ type directTCPHandler struct {
 	config *ListenerWrapper
 }
 
+type dialResult struct {
+	conn net.Conn
+	err  error
+}
+
+type handshakeFailureReporter interface {
+	HandshakeFailure(error) error
+}
+
 func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	startedAt := time.Now()
 	connectionID := connectionIDFromContext(ctx)
 	h.config.updateSessionUser(connectionID, userFromContext(ctx))
-	inbound := newCountingConn(conn)
+	if !h.config.acquireStream(connectionID) {
+		err := fmt.Errorf("%w", errStreamLimitExceeded)
+		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		reportHandshakeFailure(conn, err)
+		if onClose != nil {
+			onClose(err)
+		}
+		_ = conn.Close()
+		return
+	}
+	inbound := conn
+	var inboundCounter *countingConn
 	var outboundCounter *countingConn
+	if h.config.logger.Core().Enabled(zap.DebugLevel) {
+		inboundCounter = newCountingConn(conn)
+		inbound = inboundCounter
+	}
 	closeOnce := N.OnceClose(func(err error) {
-		if outboundCounter != nil {
+		h.config.releaseStream(connectionID)
+		if inboundCounter != nil && outboundCounter != nil {
 			h.config.logger.Debug("anytls relay closed",
 				zap.Uint64("connection_id", connectionID),
 				zap.String("event", "anytls_relay"),
@@ -33,8 +58,8 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 				zap.String("user", userFromContext(ctx)),
 				zap.String("source", source.String()),
 				zap.String("destination", destination.String()),
-				zap.Int64("bytes_from_client", inbound.BytesRead()),
-				zap.Int64("bytes_to_client", inbound.BytesWritten()),
+				zap.Int64("bytes_from_client", inboundCounter.BytesRead()),
+				zap.Int64("bytes_to_client", inboundCounter.BytesWritten()),
 				zap.Int64("bytes_from_target", outboundCounter.BytesRead()),
 				zap.Int64("bytes_to_target", outboundCounter.BytesWritten()),
 				zap.Duration("duration", time.Since(startedAt)),
@@ -53,11 +78,16 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 	outbound, err := h.dialContext(ctx, destination)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		reportHandshakeFailure(conn, err)
 		closeOnce(err)
 		_ = conn.Close()
 		return
 	}
-	outboundCounter = newCountingConn(outbound)
+	outboundRelay := outbound
+	if inboundCounter != nil {
+		outboundCounter = newCountingConn(outbound)
+		outboundRelay = outboundCounter
+	}
 
 	h.config.logger.Info("anytls connection established",
 		zap.Uint64("connection_id", connectionID),
@@ -69,13 +99,14 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		zap.String("destination", destination.String()),
 	)
 
-	relay(ctx, inbound, outboundCounter, closeOnce)
+	relay(ctx, inbound, outboundRelay, closeOnce)
 }
 
 func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, closeOnce N.CloseHandlerFunc) {
 	request, err := h.readUDPOverTCPRequest(ctx, conn, destination)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		reportHandshakeFailure(conn, err)
 		closeOnce(err)
 		_ = conn.Close()
 		return
@@ -84,6 +115,7 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 	packetConn, err := h.listenPacketContext(ctx)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), err)
+		reportHandshakeFailure(conn, err)
 		closeOnce(err)
 		_ = conn.Close()
 		return
@@ -105,28 +137,133 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 }
 
 func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	if timeout := time.Duration(h.config.ConnectTimeout); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	resolvedDestinations, err := h.validateStreamDestination(ctx, destination)
 	if err != nil {
 		return nil, err
 	}
+	resolvedDestinations = interleaveAddressFamilies(resolvedDestinations)
 
-	dialer := &net.Dialer{
-		Timeout: time.Duration(h.config.ConnectTimeout),
+	dialer := &net.Dialer{}
+	results := make(chan dialResult)
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	launchDial := func(resolvedDestination M.Socksaddr) {
+		go func() {
+			var conn net.Conn
+			var dialErr error
+			if h.config.dialFunc != nil {
+				conn, dialErr = h.config.dialFunc(dialCtx, "tcp", resolvedDestination.String())
+			} else {
+				conn, dialErr = dialer.DialContext(dialCtx, "tcp", resolvedDestination.String())
+			}
+			if dialErr != nil {
+				dialErr = fmt.Errorf("dial %s: %w", resolvedDestination.String(), dialErr)
+			}
+			results <- dialResult{conn: conn, err: dialErr}
+		}()
 	}
+
+	const fallbackDelay = 250 * time.Millisecond
+	next := 1
+	inFlight := 1
+	launchDial(resolvedDestinations[0])
+	fallbackTimer := time.NewTimer(fallbackDelay)
+	defer fallbackTimer.Stop()
+	fallbackTimerC := fallbackTimer.C
+	if len(resolvedDestinations) == 1 {
+		fallbackTimerC = nil
+	}
+
 	var errs []error
-	for _, resolvedDestination := range resolvedDestinations {
-		var conn net.Conn
-		if h.config.dialFunc != nil {
-			conn, err = h.config.dialFunc(ctx, "tcp", resolvedDestination.String())
-		} else {
-			conn, err = dialer.DialContext(ctx, "tcp", resolvedDestination.String())
+	for inFlight > 0 {
+		select {
+		case result := <-results:
+			inFlight--
+			if result.err == nil && result.conn != nil {
+				cancel()
+				go drainDialResults(results, inFlight)
+				return result.conn, nil
+			}
+			if result.err == nil {
+				result.err = errors.New("dial returned a nil connection")
+			}
+			errs = append(errs, result.err)
+			if next < len(resolvedDestinations) {
+				launchDial(resolvedDestinations[next])
+				next++
+				inFlight++
+				fallbackTimer.Reset(fallbackDelay)
+				if next < len(resolvedDestinations) {
+					fallbackTimerC = fallbackTimer.C
+				} else {
+					fallbackTimerC = nil
+				}
+			}
+		case <-fallbackTimerC:
+			launchDial(resolvedDestinations[next])
+			next++
+			inFlight++
+			if next < len(resolvedDestinations) {
+				fallbackTimer.Reset(fallbackDelay)
+			} else {
+				fallbackTimerC = nil
+			}
+		case <-ctx.Done():
+			cancel()
+			go drainDialResults(results, inFlight)
+			return nil, errors.Join(append(errs, ctx.Err())...)
 		}
-		if err == nil {
-			return conn, nil
-		}
-		errs = append(errs, fmt.Errorf("dial %s: %w", resolvedDestination.String(), err))
 	}
 	return nil, errors.Join(errs...)
+}
+
+func drainDialResults(results <-chan dialResult, remaining int) {
+	for range remaining {
+		result := <-results
+		if result.conn != nil {
+			_ = result.conn.Close()
+		}
+	}
+}
+
+func interleaveAddressFamilies(destinations []M.Socksaddr) []M.Socksaddr {
+	if len(destinations) < 2 {
+		return destinations
+	}
+	firstIsIPv6 := destinations[0].Addr.Is6()
+	preferred := make([]M.Socksaddr, 0, len(destinations))
+	alternate := make([]M.Socksaddr, 0, len(destinations))
+	for _, destination := range destinations {
+		if destination.Addr.Is6() == firstIsIPv6 {
+			preferred = append(preferred, destination)
+		} else {
+			alternate = append(alternate, destination)
+		}
+	}
+	interleaved := make([]M.Socksaddr, 0, len(destinations))
+	for len(preferred) > 0 || len(alternate) > 0 {
+		if len(preferred) > 0 {
+			interleaved = append(interleaved, preferred[0])
+			preferred = preferred[1:]
+		}
+		if len(alternate) > 0 {
+			interleaved = append(interleaved, alternate[0])
+			alternate = alternate[1:]
+		}
+	}
+	return interleaved
+}
+
+func reportHandshakeFailure(conn net.Conn, err error) {
+	if reporter, ok := conn.(handshakeFailureReporter); ok {
+		_ = reporter.HandshakeFailure(err)
+	}
 }
 
 func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {

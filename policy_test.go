@@ -6,8 +6,11 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -52,8 +55,11 @@ func TestDialContextFallsBackAcrossResolvedAddresses(t *testing.T) {
 		}, nil
 	}
 	var dialed []string
+	var dialedMu sync.Mutex
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		dialedMu.Lock()
 		dialed = append(dialed, address)
+		dialedMu.Unlock()
 		if address == "93.184.216.34:443" {
 			return nil, errors.New("first address failed")
 		}
@@ -68,8 +74,35 @@ func TestDialContextFallsBackAcrossResolvedAddresses(t *testing.T) {
 		t.Fatalf("dialContext() error = %v", err)
 	}
 	closeTest(conn)
+	dialedMu.Lock()
+	defer dialedMu.Unlock()
 	if strings.Join(dialed, ",") != "93.184.216.34:443,93.184.216.35:443" {
 		t.Fatalf("dialed = %v, want both resolved addresses", dialed)
+	}
+}
+
+func TestDialContextUsesOneTotalTimeout(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper.ConnectTimeout = caddy.Duration(60 * time.Millisecond)
+	wrapper.resolveFunc = func(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+		return []netip.Addr{
+			netip.MustParseAddr("2001:db8::1"),
+			netip.MustParseAddr("93.184.216.34"),
+			netip.MustParseAddr("93.184.216.35"),
+		}, nil
+	}
+	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	startedAt := time.Now()
+	_, err := (&directTCPHandler{config: wrapper}).dialContext(context.Background(), M.ParseSocksaddr("example.test:443"))
+	if err == nil {
+		t.Fatal("dialContext() error = nil, want timeout")
+	}
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("dialContext() elapsed = %v, want one bounded timeout", elapsed)
 	}
 }
 

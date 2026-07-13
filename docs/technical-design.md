@@ -37,12 +37,12 @@
 
 ### 连接分流
 
-`Accept()` 循环承担分流职责。对于网站流量，包装后的 listener 将连接直接返回给上游 HTTP server；对于 AnyTLS 流量，模块在内部启动会话处理并继续接受下一条连接。
+包装 listener 使用后台接收循环和有界探测并发池完成分流。TLS 握手与首包探测不会阻塞 Caddy 调用 `Accept()` 的单一 goroutine；网站流量通过结果通道返回上游 HTTP server，AnyTLS 流量则在模块内部启动会话处理。`max_pending_probes` 限制同时处于握手或探测阶段的连接数量。
 
 这一设计意味着模块需要自行维护以下运行时状态：
 
 - AnyTLS 会话生命周期
-- 并发数量控制
+- 探测、会话和子流三级并发数量控制
 - 认证和转发相关日志
 
 ### 首包窥探与无损回落
@@ -107,6 +107,9 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 - `idle_timeout = 2m`
 - `connect_timeout = 10s`
 - `max_concurrent = 128`
+- `max_pending_probes = 256`
+- `max_streams_per_session = 256`
+- `max_concurrent_streams = 1024`
 - `allow_private_targets = false`
 - `padding_scheme` 使用 `sing-anytls` 默认值
 
@@ -130,6 +133,9 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
   "idle_timeout": "2m",
   "connect_timeout": "10s",
   "max_concurrent": 128,
+  "max_pending_probes": 256,
+  "max_streams_per_session": 256,
+  "max_concurrent_streams": 1024,
   "fallback": true,
   "allow_private_targets": false,
   "allow_cidrs": [],
@@ -138,7 +144,7 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
   "deny_ports": [],
   "allow_domains": [],
   "deny_domains": [],
-  "log_node_info": true,
+  "log_node_info": false,
   "node_hosts": ["example.com"],
   "node_port": 443,
   "node_sni": "example.com",

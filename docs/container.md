@@ -33,7 +33,7 @@ docker build -t caddy-anytls:local .
 
 如需调整超时、并发、回落或私网目标策略，可参考 [examples.md](examples.md) 与 [README.md](../README.md)。
 
-默认 [Caddyfile](../Caddyfile) 开启了 `log_node_info true`，容器启动或重载成功后会在 Caddy 日志中输出 `event=anytls_node`。其中 `uri` 字段就是当前启用用户可用的 AnyTLS 节点 URI。URI 中包含密码，请控制日志访问权限。
+默认 [Caddyfile](../Caddyfile) 关闭 `log_node_info`，避免节点密码进入常规日志。只有在日志访问权限可控且确实需要输出节点 URI 时才临时开启；输出的 `uri` 字段包含完整密码。
 
 ## Docker Compose
 

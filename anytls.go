@@ -5,6 +5,7 @@ package anytls
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -32,28 +33,32 @@ func init() {
 // decide whether the connection should be handled as AnyTLS or returned to the
 // normal website path.
 type ListenerWrapper struct {
-	Users               []User         `json:"users,omitempty"`
-	ProbeTimeout        caddy.Duration `json:"probe_timeout,omitempty"`
-	IdleTimeout         caddy.Duration `json:"idle_timeout,omitempty"`
-	ConnectTimeout      caddy.Duration `json:"connect_timeout,omitempty"`
-	MaxConcurrent       int            `json:"max_concurrent,omitempty"`
-	Fallback            bool           `json:"fallback,omitempty"`
-	AllowPrivateTargets bool           `json:"allow_private_targets,omitempty"`
-	AllowCIDRs          []string       `json:"allow_cidrs,omitempty"`
-	DenyCIDRs           []string       `json:"deny_cidrs,omitempty"`
-	AllowPorts          []uint16       `json:"allow_ports,omitempty"`
-	DenyPorts           []uint16       `json:"deny_ports,omitempty"`
-	AllowDomains        []string       `json:"allow_domains,omitempty"`
-	DenyDomains         []string       `json:"deny_domains,omitempty"`
-	PaddingScheme       string         `json:"padding_scheme,omitempty"`
-	LogNodeInfo         bool           `json:"log_node_info,omitempty"`
-	NodeHosts           []string       `json:"node_hosts,omitempty"`
-	NodePort            uint16         `json:"node_port,omitempty"`
-	NodeSNI             string         `json:"node_sni,omitempty"`
-	NodeInsecure        bool           `json:"node_insecure,omitempty"`
+	Users                []User         `json:"users,omitempty"`
+	ProbeTimeout         caddy.Duration `json:"probe_timeout,omitempty"`
+	IdleTimeout          caddy.Duration `json:"idle_timeout,omitempty"`
+	ConnectTimeout       caddy.Duration `json:"connect_timeout,omitempty"`
+	MaxConcurrent        int            `json:"max_concurrent,omitempty"`
+	MaxPendingProbes     int            `json:"max_pending_probes,omitempty"`
+	MaxStreamsPerSession int            `json:"max_streams_per_session,omitempty"`
+	MaxConcurrentStreams int            `json:"max_concurrent_streams,omitempty"`
+	Fallback             bool           `json:"fallback,omitempty"`
+	AllowPrivateTargets  bool           `json:"allow_private_targets,omitempty"`
+	AllowCIDRs           []string       `json:"allow_cidrs,omitempty"`
+	DenyCIDRs            []string       `json:"deny_cidrs,omitempty"`
+	AllowPorts           []uint16       `json:"allow_ports,omitempty"`
+	DenyPorts            []uint16       `json:"deny_ports,omitempty"`
+	AllowDomains         []string       `json:"allow_domains,omitempty"`
+	DenyDomains          []string       `json:"deny_domains,omitempty"`
+	PaddingScheme        string         `json:"padding_scheme,omitempty"`
+	LogNodeInfo          bool           `json:"log_node_info,omitempty"`
+	NodeHosts            []string       `json:"node_hosts,omitempty"`
+	NodePort             uint16         `json:"node_port,omitempty"`
+	NodeSNI              string         `json:"node_sni,omitempty"`
+	NodeInsecure         bool           `json:"node_insecure,omitempty"`
 
 	logger            *zap.Logger
 	active            int64
+	activeStreams     int64
 	connSeq           uint64
 	fallbackSet       bool
 	registry          *sessionRegistry
@@ -97,6 +102,15 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	}
 	if lw.MaxConcurrent == 0 {
 		lw.MaxConcurrent = 128
+	}
+	if lw.MaxPendingProbes == 0 {
+		lw.MaxPendingProbes = 256
+	}
+	if lw.MaxStreamsPerSession == 0 {
+		lw.MaxStreamsPerSession = 256
+	}
+	if lw.MaxConcurrentStreams == 0 {
+		lw.MaxConcurrentStreams = 1024
 	}
 	if !lw.fallbackSet {
 		lw.Fallback = true
@@ -142,6 +156,15 @@ func (lw *ListenerWrapper) Validate() error {
 	if lw.MaxConcurrent < 0 {
 		return fmt.Errorf("max_concurrent must be positive")
 	}
+	if lw.MaxPendingProbes < 0 {
+		return fmt.Errorf("max_pending_probes must be positive")
+	}
+	if lw.MaxStreamsPerSession < 0 {
+		return fmt.Errorf("max_streams_per_session must be positive")
+	}
+	if lw.MaxConcurrentStreams < 0 {
+		return fmt.Errorf("max_concurrent_streams must be positive")
+	}
 	if lw.ProbeTimeout < 0 {
 		return fmt.Errorf("probe_timeout must be non-negative")
 	}
@@ -161,6 +184,7 @@ func (lw *ListenerWrapper) Validate() error {
 	}
 
 	seen := make([]string, 0, len(lw.Users))
+	passwords := make(map[[32]byte]string, len(lw.Users))
 	for _, user := range lw.Users {
 		if user.Name == "" {
 			return fmt.Errorf("user name must not be empty")
@@ -171,6 +195,11 @@ func (lw *ListenerWrapper) Validate() error {
 		if slices.Contains(seen, user.Name) {
 			return fmt.Errorf("duplicate user %q", user.Name)
 		}
+		passwordHash := sha256.Sum256([]byte(user.Password))
+		if existing, ok := passwords[passwordHash]; ok {
+			return fmt.Errorf("users %q and %q must not share a password", existing, user.Name)
+		}
+		passwords[passwordHash] = user.Name
 		seen = append(seen, user.Name)
 	}
 
@@ -179,10 +208,7 @@ func (lw *ListenerWrapper) Validate() error {
 
 // WrapListener wraps the listener with AnyTLS-aware connection routing.
 func (lw *ListenerWrapper) WrapListener(l net.Listener) net.Listener {
-	return &wrappedListener{
-		Listener: l,
-		config:   lw,
-	}
+	return newWrappedListener(l, lw)
 }
 
 var (
@@ -254,6 +280,7 @@ var (
 	errDestinationPolicyDenied  = errors.New("destination policy denied")
 	errInvalidUDPOverTCPRequest = errors.New("invalid udp over tcp request")
 	errUnsupportedUDPOverTCP    = errors.New("unsupported udp over tcp")
+	errStreamLimitExceeded      = errors.New("stream concurrency limit exceeded")
 )
 
 func (lw *ListenerWrapper) nextConnectionID() uint64 {
@@ -285,6 +312,8 @@ func dialFailureReason(err error) string {
 		return "invalid_udp_over_tcp_request"
 	case errors.Is(err, errUnsupportedUDPOverTCP):
 		return "udp_over_tcp_unsupported"
+	case errors.Is(err, errStreamLimitExceeded):
+		return "stream_limit_exceeded"
 	default:
 		return "dial_failed"
 	}

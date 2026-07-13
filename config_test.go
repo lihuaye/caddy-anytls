@@ -22,6 +22,9 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		idle_timeout 3m
 		connect_timeout 4s
 		max_concurrent 64
+		max_pending_probes 96
+		max_streams_per_session 48
+		max_concurrent_streams 512
 		fallback true
 		allow_private_targets false
 		allow_cidr 10.0.0.0/8
@@ -55,6 +58,15 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 	if wrapper.MaxConcurrent != 64 {
 		t.Fatalf("MaxConcurrent = %d, want %d", wrapper.MaxConcurrent, 64)
+	}
+	if wrapper.MaxPendingProbes != 96 {
+		t.Fatalf("MaxPendingProbes = %d, want %d", wrapper.MaxPendingProbes, 96)
+	}
+	if wrapper.MaxStreamsPerSession != 48 {
+		t.Fatalf("MaxStreamsPerSession = %d, want %d", wrapper.MaxStreamsPerSession, 48)
+	}
+	if wrapper.MaxConcurrentStreams != 512 {
+		t.Fatalf("MaxConcurrentStreams = %d, want %d", wrapper.MaxConcurrentStreams, 512)
 	}
 	if !wrapper.Fallback {
 		t.Fatal("Fallback = false, want true")

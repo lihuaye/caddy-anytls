@@ -1,55 +1,67 @@
 # caddy-anytls
 
-`caddy-anytls` 是一个 Caddy listener wrapper，用来把 AnyTLS 接入现有的 Caddy HTTPS 入口。
+`caddy-anytls` 是一个 Caddy listener wrapper，让网站与 AnyTLS 共用同一个 HTTPS 入口。
 
-它适合已经用 Caddy 托管站点，但不想再维护单独 AnyTLS 服务端、证书和额外监听端口的部署场景。Caddy 继续负责监听、TLS、证书申请和站点路由；本模块只在 TLS 解密后、HTTP 解析前识别 AnyTLS 流量，并把非 AnyTLS 流量交还给网站链路。
+Caddy 继续负责 `443` 监听、TLS、证书和网站路由；本模块只在 TLS 解密后、HTTP 解析前识别 AnyTLS。命中 AnyTLS 的连接由模块接管，其他连接无损交还原网站，因此不需要额外暴露端口或运行独立 AnyTLS 服务。
 
-## 核心能力
+## 特性
 
-- 网站和 AnyTLS 共用同一个 `443` 入口
-- 完全复用 Caddy 自动 HTTPS 和证书生命周期
-- AnyTLS 识别发生在 TLS 解密之后、HTTP 解析之前
-- 非 AnyTLS 流量无损回落到原网站
-- 支持多用户、基础 TCP 转发和 `UDP over TCP v2`
-- 默认拒绝私网目标，并支持端口、域名和 CIDR 出站策略
-- 输出结构化审计日志，可选输出当前可用节点 URI
+- 网站与 AnyTLS 共用同一个 `443` 入口
+- 复用 Caddy 自动 HTTPS 和证书生命周期
+- 非 AnyTLS 流量回落真实网站
+- 支持多用户、TCP 和 `UDP over TCP v2`
+- 默认拒绝私网目标，支持 CIDR、端口和域名策略
+- TLS 握手与首包探测采用有界并发，不阻塞 Caddy 的接收循环
+- 空闲超时按双向活动刷新，支持单向长时间传输
+- 提供会话、探测和代理子流三级资源限制
+- 多地址出站共享统一超时预算，并交错尝试 IPv4/IPv6
+- 输出结构化审计日志，可选输出节点 URI
+
+## 工作方式
+
+```text
+client
+  -> Caddy :443
+    -> TLS handshake
+      -> caddy-anytls 探测解密后的首包
+        -> AnyTLS：认证、策略校验、连接目标并转发
+        -> HTTP：交还 Caddy 网站处理链路
+```
+
+它不是独立代理程序，不自己申请证书，也不替代 Caddy 的网站能力。
 
 ## 快速开始
 
-### 方式一：使用预构建 Docker 镜像
-
-```sh
-docker pull ghcr.io/evaneonf/caddy-anytls:latest
-```
-
-准备 `Caddyfile`：
+### 1. 准备 Caddyfile
 
 ```caddyfile
 {
     servers :443 {
         listener_wrappers {
             anytls {
-                user phone-1 replace-with-strong-password
-                log_node_info true
-                node_host example.com
+                user phone-1 replace-with-a-long-random-password
             }
         }
     }
 }
 
 example.com {
+    header -Server
     respond "server is running"
 }
 ```
 
-使用前至少修改：
+部署前必须修改：
 
-- `example.com`：替换为真实域名
-- `replace-with-strong-password`：替换为强密码
+- 将 `example.com` 替换为证书可正常签发的真实域名。
+- 将示例密码替换为每个用户独立的高强度随机密码。
+- 生产环境建议用真实网站替换示例 `respond`。
 
-启动容器：
+### 2. 使用预构建镜像
 
 ```sh
+docker pull ghcr.io/evaneonf/caddy-anytls:latest
+
 docker run -d --name caddy-anytls \
   -p 80:80 \
   -p 443:443 \
@@ -60,140 +72,184 @@ docker run -d --name caddy-anytls \
   ghcr.io/evaneonf/caddy-anytls:latest
 ```
 
-查看节点 URI：
+### 3. 确认服务
+
+先确认网站可以正常访问，再配置 AnyTLS 客户端：
 
 ```sh
-docker logs caddy-anytls 2>&1 | grep anytls_node
+curl -I https://example.com
+docker logs caddy-anytls
 ```
 
-`log_node_info true` 会把包含密码的 AnyTLS URI 写入 Caddy 日志。只有在日志访问权限可控时才建议开启。
+## 本地构建
 
-### 方式二：本地构建
-
-使用 `xcaddy` 构建带模块的 Caddy：
+使用 `xcaddy` 构建包含当前模块的 Caddy：
 
 ```sh
 xcaddy build --with github.com/evaneonf/caddy-anytls=.
 ```
 
-仓库也提供了本地构建用的 Compose 配置：
+也可以直接使用仓库中的 `Dockerfile` 和 `compose.yaml`：
 
 ```sh
 docker compose up -d --build
 ```
 
-默认挂载：
+Compose 默认挂载：
 
 - `./Caddyfile -> /etc/caddy/Caddyfile`
 - `caddy_data -> /data`
 - `caddy_config -> /config`
 
-## 工作方式
+## 生产配置示例
 
-```text
-client
-  -> Caddy :443
-    -> TLS handshake
-      -> caddy-anytls 探测 TLS 后首包
-        -> AnyTLS：认证并转发
-        -> 非 AnyTLS：交还给网站处理链路
-```
-
-这个项目不是独立代理程序，不自己管理证书，也不替代 Caddy 的 HTTP 站点能力。
-
-## 节点信息
-
-Caddy 启动或重载成功后，如果开启 `log_node_info`，会输出 `event=anytls_node` 的结构化日志。每个启用用户、每个 `node_host` 会各输出一条，字段包含：
-
-- `user`
-- `host`
-- `port`
-- `sni`
-- `insecure`
-- `uri`
-
-示例 URI：
-
-```text
-anytls://replace-with-strong-password@example.com/
-```
-
-URI 格式遵循 AnyTLS 上游文档：`anytls://[auth@]hostname[:port]/?[key=value]&...`，常用参数包括 `sni` 和 `insecure`。密码会放在 URI auth 位置，特殊字符会进行百分号编码。
-
-如果没有配置 `node_host`，模块会尝试从 Caddy 站点的 host matcher 推断具体域名；通配符或 placeholder host 不会用于节点 URI。
-
-## 配置参考
-
-最小配置只需要一个站点域名和至少一个用户：
+下面的示例显式展示了资源边界和出站限制。未写出的值与默认值一致，可以按机器规模和用户数量调整。
 
 ```caddyfile
-anytls {
-    user phone-1 replace-with-strong-password
+{
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                probe_timeout 5s
+                idle_timeout 2m
+                connect_timeout 10s
+
+                max_pending_probes 256
+                max_concurrent 128
+                max_streams_per_session 256
+                max_concurrent_streams 1024
+
+                fallback true
+                allow_private_targets false
+                deny_port 25
+                deny_cidr 127.0.0.0/8 169.254.0.0/16
+                deny_domain .blocked.example
+
+                log_node_info false
+                user phone-1 replace-with-a-long-random-password
+                user laptop-1 replace-with-another-random-password
+            }
+        }
+    }
+}
+
+example.com {
+    header -Server
+    respond "server is running"
 }
 ```
 
-常用配置项：
+## 配置参考
 
-| 配置项 | 默认值 | 说明 |
+### 连接与资源
+
+| Caddyfile 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `probe_timeout` | `5s` | TLS 后首包探测超时 |
-| `idle_timeout` | `2m` | AnyTLS 会话空闲超时，会随读写活动刷新 |
-| `connect_timeout` | `10s` | 出站拨号超时 |
-| `max_concurrent` | `128` | 最大并发 AnyTLS 会话数 |
-| `fallback` | `true` | 非 AnyTLS 流量是否回落网站 |
-| `allow_private_targets` | `false` | 是否允许访问私网、回环、链路本地等目标 |
-| `allow_cidr` / `deny_cidr` | 无 | 按目标解析后的 IP CIDR 放行或拒绝 |
+| `probe_timeout` | `5s` | TLS 握手和 TLS 后首包探测超时 |
+| `idle_timeout` | `2m` | AnyTLS 会话空闲超时，任一方向有效读写都会刷新 |
+| `connect_timeout` | `10s` | DNS 解析与全部候选地址拨号共享的总超时 |
+| `max_pending_probes` | `256` | 最大并发 TLS 握手与首包探测数 |
+| `max_concurrent` | `128` | 最大并发 AnyTLS 物理会话数 |
+| `max_streams_per_session` | `256` | 单条 AnyTLS 会话的最大并发代理子流数 |
+| `max_concurrent_streams` | `1024` | 所有会话的全局最大并发代理子流数 |
+| `fallback` | `true` | 非 AnyTLS 流量是否交还网站 |
+| `padding_scheme` | 上游默认值 | `sing-anytls` padding 策略 |
+
+`max_concurrent` 限制底层 AnyTLS 会话；一条会话可以复用多个目标连接，因此还应保留子流限制。握手和探测并发达到上限后，新连接先在系统监听队列中等待，不会创建无限 goroutine。
+
+### 出站策略
+
+| Caddyfile 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `allow_private_targets` | `false` | 是否允许私网、回环、链路本地等目标 |
+| `allow_cidr` / `deny_cidr` | 无 | 按解析后的目标 IP CIDR 放行或拒绝 |
 | `allow_port` / `deny_port` | 无 | 按目标端口放行或拒绝 |
 | `allow_domain` / `deny_domain` | 无 | 按域名或域名后缀放行或拒绝 |
-| `padding_scheme` | `sing-anytls` 默认值 | AnyTLS padding 策略 |
-| `log_node_info` | `false` | 启动或重载时把当前可用节点 URI 输出到 Caddy 日志 |
-| `node_host` | 从站点 host matcher 推断 | 节点 URI 使用的服务端域名或地址，可写多个 |
-| `node_port` | 从 server listen 推断，默认 `443` | 节点 URI 使用的端口 |
-| `node_sni` | 同 `node_host` | 节点 URI 的 `sni` 参数 |
-| `node_insecure` | `false` | 节点 URI 是否输出 `insecure=1` |
-| `user <name> <password>` | 无 | 添加一个启用状态的用户 |
 
 策略规则：
 
-- `deny_*` 优先于 `allow_*`
-- 配置了 `allow_*` 后，未命中的目标会被拒绝
-- `allow_private_targets false` 时，域名会先解析再检查所有返回地址
-- `allow_cidr` 可以精确放行特定 CIDR，包括默认私网保护下的受控内网段
+- `deny_*` 优先于 `allow_*`。
+- 配置任意 `allow_*` 后，未命中的对应目标会被拒绝。
+- 域名会先解析，再检查所有返回地址，随后只拨号已经检查过的 IP。
+- `allow_cidr` 可以精确放行默认私网保护下的受控网段。
+- 多个可用地址会在一个 `connect_timeout` 内交错尝试 IPv4/IPv6，而不是逐地址累加超时。
 
-更多配置示例见 [docs/examples.md](docs/examples.md)。
+### 用户与节点 URI
 
-## 运行行为
+| Caddyfile 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `user <name> <password>` | 无 | 添加一个启用用户；用户名和密码都必须唯一 |
+| `log_node_info` | `false` | 启动或重载时是否把节点 URI 写入日志 |
+| `node_host` | 从站点 host matcher 推断 | 节点域名或地址，可配置多个 |
+| `node_port` | 从 server listen 推断，通常为 `443` | 节点端口 |
+| `node_sni` | 同 `node_host` | 节点 URI 中的 SNI |
+| `node_insecure` | `false` | 是否在节点 URI 中输出 `insecure=1` |
 
-- 普通 HTTPS 请求照常进入网站
-- AnyTLS 客户端连接会在 TLS 后被模块接管
-- `sp.v2.udp-over-tcp.arpa` 按 `UDP over TCP v2` 处理
-- 已禁用用户命中 AnyTLS 首包时会被直接拒绝，不会回落到网站
-- 配置 reload 或卸载时，现有 AnyTLS 会话会被主动终止
-- 默认拒绝私网目标，包括域名解析后的私网地址
-- TCP 出站域名若解析出多个可用地址，会按顺序尝试拨号
+如需临时获取客户端 URI，可在现有 `listener_wrappers` 的 `anytls` 配置块中加入：
+
+```caddyfile
+anytls {
+    log_node_info true
+    node_host example.com
+    user phone-1 replace-with-a-long-random-password
+}
+```
+
+重载后查找 `event=anytls_node`：
+
+```sh
+docker logs caddy-anytls 2>&1 | grep anytls_node
+```
+
+日志中的 `uri` 可以直接用于客户端，例如：
+
+```text
+anytls://replace-with-a-long-random-password@example.com/
+```
+
+URI 中包含完整密码。获取后应重新关闭 `log_node_info`，并避免把相关日志发送到不受控的日志平台。
+
+如果未配置 `node_host`，模块会尝试从 Caddy 站点的 host matcher 推断；通配符和 placeholder 不会用于生成节点 URI。
+
+JSON 配置使用相应的复数数组字段，例如 `users`、`allow_cidrs`、`deny_ports`、`node_hosts`。完整示例见 [docs/examples.md](docs/examples.md)。
+
+## 运行行为与限制
+
+- 普通 HTTPS 请求照常进入网站。
+- AnyTLS 客户端在 TLS 后被模块接管。
+- `sp.v2.udp-over-tcp.arpa` 按 `UDP over TCP v2` 处理。
+- 已禁用用户命中 AnyTLS 首包时会被拒绝，不会回落网站。
+- UDP 目标解析在单条代理子流内缓存 30 秒，缓存最多保留 256 个目标。
+- 配置 reload 或模块卸载会主动结束已有 AnyTLS 会话。
+- 一条 AnyTLS 会话复用单条 TCP，弱网丢包可能使该会话内的多个子流同时受队头阻塞；这是协议层限制。
+- 网站回落可以降低未认证主动探测特征，但不能隐藏 SNI、证书、客户端 TLS 指纹或所有流量时序特征。
 
 ## 日志
 
-模块输出结构化审计日志。常见字段包括：
+模块输出结构化日志。常见字段包括：
 
-- `connection_id`
-- `event`
-- `outcome`
-- `reason`
-- `protocol`
-- `uot_is_connect`
-- `user`
-- `source`
-- `destination`
+- `connection_id`、`event`、`outcome`、`reason`
+- `protocol`、`uot_is_connect`
+- `user`、`source`、`destination`
 - `duration`
-- `bytes_from_client`
-- `bytes_to_client`
-- `bytes_from_target`
-- `bytes_to_target`
+- `bytes_from_client`、`bytes_to_client`
+- `bytes_from_target`、`bytes_to_target`
 
-典型事件包括认证成功、网站 fallback、禁用用户拒绝、策略拒绝、私网目标拒绝、relay 关闭、节点 URI 输出和配置卸载导致的会话终止。
+同一个 `connection_id` 可以对应多个目标地址，因为它标识底层 AnyTLS 会话，而不是单个复用子流。
 
-## 文档
+常见事件包括认证成功、网站 fallback、用户或策略拒绝、出站失败、relay 关闭和配置卸载。公网无效 TLS 握手仅记录为 Debug，避免扫描流量放大 Warn 日志；字节计数也只在 Debug 日志开启时采集。
+
+## 开发与验证
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+staticcheck ./...
+golangci-lint run
+```
+
+## 更多文档
 
 - [产品说明](docs/product.md)
 - [技术设计](docs/technical-design.md)

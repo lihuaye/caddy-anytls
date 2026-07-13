@@ -27,6 +27,7 @@ xcaddy build --with github.com/evaneonf/caddy-anytls=.
 }
 
 example.com {
+    header -Server
     respond "server is running"
 }
 ```
@@ -57,6 +58,9 @@ example.com {
                 idle_timeout 2m
                 connect_timeout 10s
                 max_concurrent 128
+                max_pending_probes 256
+                max_streams_per_session 256
+                max_concurrent_streams 1024
                 fallback true
                 allow_private_targets false
 
@@ -94,6 +98,9 @@ example.com {
   "idle_timeout": "2m",
   "connect_timeout": "10s",
   "max_concurrent": 128,
+  "max_pending_probes": 256,
+  "max_streams_per_session": 256,
+  "max_concurrent_streams": 1024,
   "fallback": true,
   "allow_private_targets": false,
   "allow_cidrs": [],
@@ -127,6 +134,9 @@ example.com {
 | `idle_timeout` | `2m` | AnyTLS 会话空闲超时 |
 | `connect_timeout` | `10s` | 出站拨号超时 |
 | `max_concurrent` | `128` | 最大并发 AnyTLS 会话数 |
+| `max_pending_probes` | `256` | 最大并发 TLS 握手与首包探测数 |
+| `max_streams_per_session` | `256` | 每条 AnyTLS 会话的最大并发子流数 |
+| `max_concurrent_streams` | `1024` | 全局最大并发代理子流数 |
 | `fallback` | `true` | 非 AnyTLS 流量回落网站 |
 | `allow_private_targets` | `false` | 默认拒绝常见私网目标 |
 | `allow_cidr` / `allow_cidrs` | 无 | 只允许访问指定 CIDR |
@@ -157,7 +167,7 @@ example.com {
 - 网站请求链路不参与 AnyTLS 会话清理
 - HTTP/1 与 HTTP/2 网站首包会快速回落，不需要等待完整 AnyTLS 哈希探测
 - 域名目标会先解析再执行私网和 CIDR 策略
-- TCP 域名目标解析出多个地址时，会按顺序尝试可用地址
+- TCP 域名目标解析出多个地址时，会在统一超时预算内交错 IPv4/IPv6 并发尝试
 - `allow_cidr`、`deny_cidr`、`allow_port`、`deny_port`、`allow_domain`、`deny_domain` 可组合限制出站目标
 
 ## 节点信息输出

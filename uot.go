@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
@@ -13,8 +14,10 @@ import (
 
 func relayUDPOverTCP(ctx context.Context, inbound *uot.Conn, outbound net.PacketConn, prepareDestination func(context.Context, M.Socksaddr) (net.Addr, error), onClose N.CloseHandlerFunc) {
 	var once sync.Once
+	done := make(chan struct{})
 	closeAll := func(err error) {
 		once.Do(func() {
+			close(done)
 			if onClose != nil {
 				onClose(err)
 			}
@@ -24,8 +27,11 @@ func relayUDPOverTCP(ctx context.Context, inbound *uot.Conn, outbound net.Packet
 	}
 
 	go func() {
-		<-ctx.Done()
-		closeAll(ctx.Err())
+		select {
+		case <-ctx.Done():
+			closeAll(ctx.Err())
+		case <-done:
+		}
 	}()
 
 	go func() {
@@ -39,6 +45,12 @@ func relayUDPOverTCP(ctx context.Context, inbound *uot.Conn, outbound net.Packet
 func proxyUOTToPacket(ctx context.Context, inbound *uot.Conn, outbound net.PacketConn, prepareDestination func(context.Context, M.Socksaddr) (net.Addr, error)) error {
 	packet := buf.NewPacket()
 	defer packet.Release()
+	type cacheEntry struct {
+		addr      net.Addr
+		expiresAt time.Time
+	}
+	const maxCachedDestinations = 256
+	destinationCache := make(map[string]cacheEntry)
 
 	for {
 		packet.Reset()
@@ -46,11 +58,20 @@ func proxyUOTToPacket(ctx context.Context, inbound *uot.Conn, outbound net.Packe
 		if err != nil {
 			return err
 		}
-		addr, err := prepareDestination(ctx, destination)
-		if err != nil {
-			return err
+		key := destination.String()
+		cached, ok := destinationCache[key]
+		if !ok || time.Now().After(cached.expiresAt) {
+			addr, err := prepareDestination(ctx, destination)
+			if err != nil {
+				return err
+			}
+			if len(destinationCache) >= maxCachedDestinations {
+				clear(destinationCache)
+			}
+			cached = cacheEntry{addr: addr, expiresAt: time.Now().Add(30 * time.Second)}
+			destinationCache[key] = cached
 		}
-		if _, err := outbound.WriteTo(packet.Bytes(), addr); err != nil {
+		if _, err := outbound.WriteTo(packet.Bytes(), cached.addr); err != nil {
 			return err
 		}
 	}

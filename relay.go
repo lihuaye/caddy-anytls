@@ -42,8 +42,10 @@ func (c *countingConn) BytesWritten() int64 {
 
 func relay(ctx context.Context, inbound net.Conn, outbound net.Conn, onClose N.CloseHandlerFunc) {
 	var once sync.Once
+	done := make(chan struct{})
 	closeAll := func(err error) {
 		once.Do(func() {
+			close(done)
 			if onClose != nil {
 				onClose(err)
 			}
@@ -53,8 +55,11 @@ func relay(ctx context.Context, inbound net.Conn, outbound net.Conn, onClose N.C
 	}
 
 	go func() {
-		<-ctx.Done()
-		closeAll(ctx.Err())
+		select {
+		case <-ctx.Done():
+			closeAll(ctx.Err())
+		case <-done:
+		}
 	}()
 
 	go proxyCopy(inbound, outbound, closeAll)

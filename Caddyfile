@@ -3,7 +3,7 @@
 		listener_wrappers {
 			anytls {
 				user device-1 change-this-password
-				log_node_info true
+				log_node_info false
 				node_host example.com
 			}
 		}
@@ -12,5 +12,6 @@
 
 # Replace example.com with your real domain before deploying.
 example.com {
+	header -Server
 	respond "server is running"
 }
