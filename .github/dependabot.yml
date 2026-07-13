@@ -3,17 +3,16 @@ multi-ecosystem-groups:
   go-runtime:
     schedule:
       interval: weekly
+    open-pull-requests-limit: 5
 updates:
   - package-ecosystem: gomod
     directory: /
     multi-ecosystem-group: go-runtime
-    open-pull-requests-limit: 5
     patterns:
       - "*"
 
   - package-ecosystem: docker
     directory: /
     multi-ecosystem-group: go-runtime
-    open-pull-requests-limit: 5
     patterns:
       - caddy
