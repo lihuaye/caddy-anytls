@@ -66,6 +66,31 @@ func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *Liste
 	return wrapper
 }
 
+// newTestAnyTLSClient builds a sing-anytls client whose outgoing connections
+// are enqueued on the given chanListener, mirroring the inline client setup
+// used across the integration tests.
+func newTestAnyTLSClient(t *testing.T, base *chanListener, password string) *singanytls.Client {
+	t.Helper()
+
+	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+		Password:                 password,
+		IdleSessionCheckInterval: 100 * time.Millisecond,
+		IdleSessionTimeout:       time.Second,
+		MinIdleSession:           0,
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			serverConn, clientConn := net.Pipe()
+			base.enqueue(serverConn)
+			return clientConn, nil
+		},
+		Logger: zapLogger{base: zap.NewNop()},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { closeTest(client) })
+	return client
+}
+
 func newTestCertificate(t *testing.T) tls.Certificate {
 	t.Helper()
 

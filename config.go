@@ -182,24 +182,60 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 		case "user":
 			args := d.RemainingArgs()
-			if len(args) != 2 {
+			if len(args) != 2 && len(args) != 3 {
 				return d.ArgErr()
 			}
-			lw.Users = append(lw.Users, User{
+			user := User{
 				Name:     args[0],
 				Password: args[1],
 				Enabled:  true,
-			})
+			}
+			if len(args) == 3 {
+				user.Outbound = args[2]
+			}
+			lw.Users = append(lw.Users, user)
 
 		case "outbound":
-			if len(lw.OutboundRaw) != 0 {
-				return d.Errf("outbound may only be specified once")
-			}
+			// Disambiguated by argument count using nested NextArg:
+			//   outbound <module> {...}        -> default outbound (OutboundRaw)
+			//   outbound <name> <module> {...} -> named outbound (OutboundsRaw)
+			// In both forms the cursor stays on the module-name token, which is
+			// what UnmarshalModule expects as the start of its segment.
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			name := d.Val()
-			modID := "caddy.listeners.anytls.outbounds." + name
+			firstArg := d.Val()
+			if d.NextArg() {
+				// Named form: firstArg is the outbound name.
+				outboundName := firstArg
+				moduleName := d.Val()
+				if outboundName == "" {
+					return d.Errf("named outbound must not have an empty name")
+				}
+				if _, ok := lw.OutboundsRaw[outboundName]; ok {
+					return d.Errf("outbound %q may only be declared once", outboundName)
+				}
+				modID := "caddy.listeners.anytls.outbounds." + moduleName
+				unm, err := caddyfile.UnmarshalModule(d, modID)
+				if err != nil {
+					return err
+				}
+				if _, ok := unm.(Outbound); !ok {
+					return d.Errf("module %s is not an anytls outbound", modID)
+				}
+				if lw.OutboundsRaw == nil {
+					lw.OutboundsRaw = make(map[string]json.RawMessage)
+				}
+				lw.OutboundsRaw[outboundName] = caddyconfig.JSONModuleObject(unm, "dialer", moduleName, nil)
+				break
+			}
+			// Default form: firstArg is the module name. Only the unnamed form
+			// is limited to a single occurrence.
+			if len(lw.OutboundRaw) != 0 {
+				return d.Errf("outbound may only be specified once")
+			}
+			moduleName := firstArg
+			modID := "caddy.listeners.anytls.outbounds." + moduleName
 			unm, err := caddyfile.UnmarshalModule(d, modID)
 			if err != nil {
 				return err
@@ -207,7 +243,22 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if _, ok := unm.(Outbound); !ok {
 				return d.Errf("module %s is not an anytls outbound", modID)
 			}
-			lw.OutboundRaw = caddyconfig.JSONModuleObject(unm, "dialer", name, nil)
+			lw.OutboundRaw = caddyconfig.JSONModuleObject(unm, "dialer", moduleName, nil)
+
+		case "default_outbound":
+			if lw.DefaultOutbound != "" {
+				return d.Errf("default_outbound may only be specified once")
+			}
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			lw.DefaultOutbound = d.Val()
+			if lw.DefaultOutbound == "" {
+				return d.Errf("default_outbound must not be empty")
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
 
 		default:
 			return d.ArgErr()
@@ -221,29 +272,31 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // defaults and applies the documented enabled-by-default user behavior.
 func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 	var config struct {
-		Users                []User          `json:"users,omitempty"`
-		ProbeTimeout         caddy.Duration  `json:"probe_timeout,omitempty"`
-		IdleTimeout          caddy.Duration  `json:"idle_timeout,omitempty"`
-		ConnectTimeout       caddy.Duration  `json:"connect_timeout,omitempty"`
-		MaxConcurrent        int             `json:"max_concurrent,omitempty"`
-		MaxPendingProbes     int             `json:"max_pending_probes,omitempty"`
-		MaxStreamsPerSession int             `json:"max_streams_per_session,omitempty"`
-		MaxConcurrentStreams int             `json:"max_concurrent_streams,omitempty"`
-		Fallback             bool            `json:"fallback,omitempty"`
-		AllowPrivateTargets  bool            `json:"allow_private_targets,omitempty"`
-		AllowCIDRs           []string        `json:"allow_cidrs,omitempty"`
-		DenyCIDRs            []string        `json:"deny_cidrs,omitempty"`
-		AllowPorts           []uint16        `json:"allow_ports,omitempty"`
-		DenyPorts            []uint16        `json:"deny_ports,omitempty"`
-		AllowDomains         []string        `json:"allow_domains,omitempty"`
-		DenyDomains          []string        `json:"deny_domains,omitempty"`
-		PaddingScheme        string          `json:"padding_scheme,omitempty"`
-		LogNodeInfo          bool            `json:"log_node_info,omitempty"`
-		NodeHosts            []string        `json:"node_hosts,omitempty"`
-		NodePort             uint16          `json:"node_port,omitempty"`
-		NodeSNI              string          `json:"node_sni,omitempty"`
-		NodeInsecure         bool            `json:"node_insecure,omitempty"`
-		OutboundRaw          json.RawMessage `json:"outbound,omitempty"`
+		Users                []User                     `json:"users,omitempty"`
+		ProbeTimeout         caddy.Duration             `json:"probe_timeout,omitempty"`
+		IdleTimeout          caddy.Duration             `json:"idle_timeout,omitempty"`
+		ConnectTimeout       caddy.Duration             `json:"connect_timeout,omitempty"`
+		MaxConcurrent        int                        `json:"max_concurrent,omitempty"`
+		MaxPendingProbes     int                        `json:"max_pending_probes,omitempty"`
+		MaxStreamsPerSession int                        `json:"max_streams_per_session,omitempty"`
+		MaxConcurrentStreams int                        `json:"max_concurrent_streams,omitempty"`
+		Fallback             bool                       `json:"fallback,omitempty"`
+		AllowPrivateTargets  bool                       `json:"allow_private_targets,omitempty"`
+		AllowCIDRs           []string                   `json:"allow_cidrs,omitempty"`
+		DenyCIDRs            []string                   `json:"deny_cidrs,omitempty"`
+		AllowPorts           []uint16                   `json:"allow_ports,omitempty"`
+		DenyPorts            []uint16                   `json:"deny_ports,omitempty"`
+		AllowDomains         []string                   `json:"allow_domains,omitempty"`
+		DenyDomains          []string                   `json:"deny_domains,omitempty"`
+		PaddingScheme        string                     `json:"padding_scheme,omitempty"`
+		LogNodeInfo          bool                       `json:"log_node_info,omitempty"`
+		NodeHosts            []string                   `json:"node_hosts,omitempty"`
+		NodePort             uint16                     `json:"node_port,omitempty"`
+		NodeSNI              string                     `json:"node_sni,omitempty"`
+		NodeInsecure         bool                       `json:"node_insecure,omitempty"`
+		OutboundRaw          json.RawMessage            `json:"outbound,omitempty"`
+		OutboundsRaw         map[string]json.RawMessage `json:"outbounds,omitempty"`
+		DefaultOutbound      string                     `json:"default_outbound,omitempty"`
 	}
 	if err := json.Unmarshal(data, &config); err != nil {
 		return err
@@ -271,6 +324,8 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 	lw.NodeSNI = config.NodeSNI
 	lw.NodeInsecure = config.NodeInsecure
 	lw.OutboundRaw = config.OutboundRaw
+	lw.OutboundsRaw = config.OutboundsRaw
+	lw.DefaultOutbound = config.DefaultOutbound
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {

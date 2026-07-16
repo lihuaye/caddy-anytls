@@ -10,6 +10,7 @@ Caddy 继续负责 `443` 监听、TLS、证书和网站路由；本模块只在 
 - 复用 Caddy 自动 HTTPS 和证书生命周期
 - 非 AnyTLS 流量回落真实网站
 - 支持多用户、TCP 和 `UDP over TCP v2`
+- 支持多个具名出站并按用户选择出口（如部分账号走 WireGuard 家宽、部分直连）
 - 默认拒绝私网目标，支持 CIDR、端口和域名策略
 - TLS 握手与首包探测采用有界并发，不阻塞 Caddy 的接收循环
 - 空闲超时按双向活动刷新，支持单向长时间传输
@@ -165,7 +166,9 @@ example.com {
 | `allow_cidr` / `deny_cidr` | 无 | 按解析后的目标 IP CIDR 放行或拒绝 |
 | `allow_port` / `deny_port` | 无 | 按目标端口放行或拒绝 |
 | `allow_domain` / `deny_domain` | 无 | 按域名或域名后缀放行或拒绝 |
-| `outbound <name> { ... }` | `direct` | 选择出站模块，决定认证后的目标流量从哪里发出 |
+| `outbound <module> { ... }` | `direct` | 选择默认出站模块，决定认证后的目标流量从哪里发出 |
+| `outbound <name> <module> { ... }` | 无 | 声明一个具名出站，供 `user` 或 `default_outbound` 按名引用 |
+| `default_outbound <name>` | 无 | 未标注出站的用户使用的具名出站；不写时依次落到单 `outbound`、内置 `direct` |
 
 策略规则：
 
@@ -179,7 +182,7 @@ example.com {
 
 | Caddyfile 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `user <name> <password>` | 无 | 添加一个启用用户；用户名和密码都必须唯一 |
+| `user <name> <password> [outbound]` | 无 | 添加一个启用用户；用户名和密码都必须唯一；第 3 个参数按名引用具名出站（或内置 `direct`），省略走默认出站 |
 | `log_node_info` | `false` | 启动或重载时是否把节点 URI 写入日志 |
 | `node_host` | 从站点 host matcher 推断 | 节点域名或地址，可配置多个 |
 | `node_port` | 从 server listen 推断，通常为 `443` | 节点端口 |
@@ -204,8 +207,29 @@ anytls {
 }
 ```
 
+还可以声明多个具名出站，让不同账号走不同出口（客户端配置多个仅密码不同的节点即可切换）：
+
+```caddyfile
+anytls {
+    outbound wg-home wireguard {
+        private_key     <base64 客户端私钥>
+        peer_public_key <base64 服务端公钥>
+        endpoint        home.example.com:51820
+        address         10.7.0.2
+        allowed_ips     0.0.0.0/0 ::/0
+    }
+    default_outbound wg-home
+
+    user phone-home   replace-with-password-1          # -> 默认（wg-home）
+    user phone-direct replace-with-password-2 direct   # -> 内置直连
+}
+```
+
 - 出站模块注册在 `caddy.listeners.anytls.outbounds` 命名空间下。
-- 内置 `direct` 无需配置，是不写 `outbound` 时的默认行为。
+- 内置 `direct` 无需配置，是不写 `outbound` 时的默认行为；也可被 `user` 直接按名引用，无需声明。
+- 保留名 `direct` 和 `default` 不允许作为具名出站的名字；引用未声明的出站名会在配置阶段报错。
+- 未标注出站的用户按 `default_outbound` → 单 `outbound` → 内置 `direct` 的顺序解析默认出口，老配置行为不变。
+- 连接建立日志（`anytls connection established`）与节点日志带 `outbound` 字段，标注该连接/该账号实际使用的出站名。
 - 目标策略（私网拒绝、CIDR/端口/域名规则）和域名解析仍在出站之前完成，出站模块只负责搬运字节。
 - 域名使用运行 Caddy 的宿主机 DNS 解析后再交给出站模块；当前不支持由远端出口或隧道内 DNS 解析目标域名。
 - WireGuard 出站是一个独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)，用户态实现（wireguard-go + netstack），无需内核模块、TUN 设备或 root。构建方式：
@@ -265,7 +289,7 @@ JSON 配置使用相应的复数数组字段，例如 `users`、`allow_cidrs`、
 
 - `connection_id`、`event`、`outcome`、`reason`
 - `protocol`、`uot_is_connect`
-- `user`、`source`、`destination`
+- `user`、`outbound`、`source`、`destination`
 - `duration`
 - `bytes_from_client`、`bytes_to_client`
 - `bytes_from_target`、`bytes_to_target`

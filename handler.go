@@ -33,10 +33,13 @@ type handshakeSuccessReporter interface {
 func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	startedAt := time.Now()
 	connectionID := connectionIDFromContext(ctx)
+	// The outbound name is resolved once per connection and reused, so the
+	// concurrent happy-eyeballs dial goroutines never log it repeatedly.
+	_, outboundName := h.outboundForUser(ctx)
 	h.config.updateSessionUser(connectionID, userFromContext(ctx))
 	if !h.config.acquireStream(connectionID) {
 		err := fmt.Errorf("%w", errStreamLimitExceeded)
-		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
 		if onClose != nil {
 			onClose(err)
@@ -75,13 +78,13 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 	})
 
 	if isUDPOverTCPDestination(destination) {
-		h.handleUDPOverTCP(ctx, conn, source, destination, startedAt, connectionID, closeOnce)
+		h.handleUDPOverTCP(ctx, conn, source, destination, startedAt, connectionID, outboundName, closeOnce)
 		return
 	}
 
 	outbound, err := h.dialContext(ctx, destination)
 	if err != nil {
-		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
 		closeOnce(err)
 		_ = conn.Close()
@@ -106,6 +109,7 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		zap.String("outcome", "authenticated"),
 		zap.String("protocol", "tcp"),
 		zap.String("user", userFromContext(ctx)),
+		zap.String("outbound", outboundName),
 		zap.String("source", source.String()),
 		zap.String("destination", destination.String()),
 	)
@@ -113,10 +117,10 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 	relay(ctx, inbound, outboundRelay, closeOnce)
 }
 
-func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, closeOnce N.CloseHandlerFunc) {
+func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, outboundName string, closeOnce N.CloseHandlerFunc) {
 	request, err := h.readUDPOverTCPRequest(ctx, conn, destination)
 	if err != nil {
-		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
 		closeOnce(err)
 		_ = conn.Close()
@@ -125,7 +129,7 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 
 	packetConn, err := h.listenPacketContext(ctx)
 	if err != nil {
-		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), err)
+		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
 		closeOnce(err)
 		_ = conn.Close()
@@ -147,6 +151,7 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 		zap.String("protocol", "udp_over_tcp_v2"),
 		zap.Bool("uot_is_connect", request.IsConnect),
 		zap.String("user", userFromContext(ctx)),
+		zap.String("outbound", outboundName),
 		zap.String("source", source.String()),
 		zap.String("destination", request.Destination.String()),
 	)
@@ -310,24 +315,32 @@ func (h *directTCPHandler) dialResolved(ctx context.Context, address string) (ne
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	return h.outbound().DialContext(ctx, "tcp", address)
+	outbound, _ := h.outboundForUser(ctx)
+	return outbound.DialContext(ctx, "tcp", address)
 }
 
 func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {
 	if h.config.listenPacketFunc != nil {
 		return h.config.listenPacketFunc(ctx, "udp", "")
 	}
-	return h.outbound().ListenPacket(ctx, "udp", "")
+	outbound, _ := h.outboundForUser(ctx)
+	return outbound.ListenPacket(ctx, "udp", "")
 }
 
-// outbound returns the configured egress module, falling back to a direct
-// outbound when Provision has not run (for example in unit tests that build a
-// wrapper by hand).
-func (h *directTCPHandler) outbound() Outbound {
-	if h.config.outbound != nil {
-		return h.config.outbound
+// outboundForUser resolves the egress module and its log name for the
+// authenticated user carried by ctx. Fallback chain: the user's explicit
+// outbound reference, then the resolved default outbound, then the single
+// configured outbound, then a direct outbound (the last two tiers cover
+// wrappers built by hand without Provision, for example in unit tests). All
+// maps involved are read-only after Provision, so the concurrent
+// happy-eyeballs dial goroutines can call this without locking; repeated
+// calls for one connection are idempotent.
+func (h *directTCPHandler) outboundForUser(ctx context.Context) (Outbound, string) {
+	user := userFromContext(ctx)
+	if outbound, ok := h.config.userOutbound[user]; ok {
+		return outbound, h.config.userOutboundName[user]
 	}
-	return &DirectOutbound{}
+	return h.config.resolveDefaultOutbound()
 }
 
 func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {
@@ -381,7 +394,7 @@ func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M
 	return destinations, nil
 }
 
-func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, err error) {
+func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, outboundName string, err error) {
 	protocol := "tcp"
 	if isUDPOverTCPDestination(destination) {
 		protocol = "udp_over_tcp_v2"
@@ -393,6 +406,7 @@ func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Sock
 		zap.String("reason", dialFailureReason(err)),
 		zap.String("protocol", protocol),
 		zap.String("user", user),
+		zap.String("outbound", outboundName),
 		zap.String("source", source.String()),
 		zap.String("destination", destination.String()),
 		zap.Duration("duration", time.Since(startedAt)),
