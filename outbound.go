@@ -41,6 +41,16 @@ type Outbound interface {
 	ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error)
 }
 
+// Reserved outbound names that must not be declared under "outbounds".
+// "direct" always resolves to the built-in DirectOutbound and can be
+// referenced without a declaration. "default" is the log sentinel for the
+// legacy unnamed single "outbound" default tier and is kept reserved so the
+// sentinel can never collide with a declared name.
+const (
+	reservedOutboundDirect  = "direct"
+	reservedOutboundDefault = "default"
+)
+
 func init() {
 	caddy.RegisterModule(&DirectOutbound{})
 }

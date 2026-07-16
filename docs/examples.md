@@ -169,6 +169,7 @@ example.com {
 - 域名目标会先解析再执行私网和 CIDR 策略
 - TCP 域名目标解析出多个地址时，会在统一超时预算内交错 IPv4/IPv6 并发尝试
 - `allow_cidr`、`deny_cidr`、`allow_port`、`deny_port`、`allow_domain`、`deny_domain` 可组合限制出站目标
+- 可声明多个具名出站并按用户选择出口（TCP 与 UDP over TCP 均生效），见下文「按用户选择出站」
 
 ## 节点信息输出
 
@@ -247,6 +248,76 @@ example.com {
 - 不写 `outbound` 时使用内置 `direct`，等价于原有直连行为
 
 配置项、密钥生成和家宽侧准备见 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard) 的 README。
+
+## 按用户选择出站（多出站）
+
+同一个 `:443` 入口可以声明多个具名出站，并让不同账号走不同出口。客户端只需要配置多个「节点」（同 IP、同端口、同 SNI、单证书，仅密码不同）即可切换出口。
+
+```caddyfile
+{
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                # 具名出站：outbound <name> <module> { ...模块配置... }
+                outbound wg-home wireguard {
+                    private_key     <base64 客户端私钥>
+                    peer_public_key <base64 服务端公钥>
+                    endpoint        home.example.com:51820
+                    address         10.7.0.2
+                    allowed_ips     0.0.0.0/0 ::/0
+                }
+
+                # 默认出站（可选）：未标注出站的用户走它
+                default_outbound wg-home
+
+                # user <name> <password> [outbound-name]
+                user phone-home   replace-with-password-1          # -> 默认（wg-home）
+                user phone-direct replace-with-password-2 direct   # -> 内置直连
+                user laptop       replace-with-password-3 wg-home  # 显式引用
+            }
+        }
+    }
+}
+
+example.com {
+    respond "server is running"
+}
+```
+
+规则说明：
+
+- `outbound <name> <module>`（2 个参数）声明具名出站；`outbound <module>`（1 个参数）仍是原有的单默认出站写法，语义不变。
+- `user` 的第 3 个参数按名引用某个具名出站，省略时走默认出站。
+- 默认出站解析顺序：`default_outbound` 指定的具名出站 → 单 `outbound` 模块 → 内置 `direct`。老配置（只有单 `outbound` 或什么都不写）行为完全不变。
+- 保留名 `direct` 与 `default` 不允许在具名出站中声明。`direct` 始终指向内置直连出站，无需声明即可被 `user` 引用；`default` 是旧式单 `outbound` 默认档在日志中的哨兵名。
+- 引用未声明的出站名、具名出站重名、`default_outbound` 指令重复出现均会在配置阶段报错。
+
+对应的 JSON 配置：
+
+```json
+{
+  "wrapper": "anytls",
+  "outbounds": {
+    "wg-home": {
+      "dialer": "wireguard",
+      "endpoint": "home.example.com:51820"
+    }
+  },
+  "default_outbound": "wg-home",
+  "users": [
+    {"name": "phone-home", "password": "..."},
+    {"name": "phone-direct", "password": "...", "outbound": "direct"},
+    {"name": "laptop", "password": "...", "outbound": "wg-home"}
+  ]
+}
+```
+
+注意：JSON 的 `outbounds` 是对象，重复键会被 JSON 解析器静默取后者，重名检测仅在 Caddyfile 路径可用。
+
+可观测性：
+
+- Info 级 `anytls connection established` 日志带 `outbound` 字段，记录该连接实际使用的出站名（具名引用或 `default_outbound` 命中时为其名；`direct` 引用或兜底为 `direct`；旧式单 `outbound` 默认档为哨兵 `default`）。
+- 开启 `log_node_info` 时，每个用户的节点日志同样带 `outbound` 字段，便于核对哪个账号走哪个出口。
 
 ## 已知限制
 

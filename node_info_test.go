@@ -92,6 +92,47 @@ func TestLogNodeInfo(t *testing.T) {
 	}
 }
 
+// Every node info entry carries the outbound name the account will use: the
+// explicit per-user reference when present, otherwise the resolved default
+// outbound name.
+func TestLogNodeInfoIncludesOutboundNames(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	wrapper := &ListenerWrapper{
+		Users: []User{
+			{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "wg-home"},
+			{Name: "bob", Password: "bob-pass", Enabled: true},
+		},
+		LogNodeInfo:         true,
+		NodeHosts:           []string{"example.com"},
+		logger:              zap.New(core),
+		defaultOutbound:     new(DirectOutbound),
+		defaultOutboundName: "wg-default",
+	}
+
+	wrapper.logNodeInfo(nil)
+
+	entries := logs.FilterMessage("anytls node available").All()
+	if len(entries) != 2 {
+		t.Fatalf("node log count = %d, want 2", len(entries))
+	}
+	want := map[string]string{
+		"alice": "wg-home",
+		"bob":   "wg-default",
+	}
+	for _, entry := range entries {
+		fields := entry.ContextMap()
+		user, _ := fields["user"].(string)
+		wantOutbound, ok := want[user]
+		if !ok {
+			t.Fatalf("unexpected node log user %q", user)
+		}
+		if fields["outbound"] != wantOutbound {
+			t.Fatalf("user %s outbound = %v, want %q", user, fields["outbound"], wantOutbound)
+		}
+		delete(want, user)
+	}
+}
+
 func TestInferNodeHosts(t *testing.T) {
 	server := &caddyhttp.Server{
 		Routes: caddyhttp.RouteList{
