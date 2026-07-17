@@ -26,6 +26,10 @@ type handshakeFailureReporter interface {
 	HandshakeFailure(error) error
 }
 
+type handshakeSuccessReporter interface {
+	HandshakeSuccess() error
+}
+
 func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	startedAt := time.Now()
 	connectionID := connectionIDFromContext(ctx)
@@ -91,6 +95,13 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		outboundCounter = newCountingConn(outbound)
 		outboundRelay = outboundCounter
 	}
+	if err := reportHandshakeSuccess(conn); err != nil {
+		h.logHandshakeSuccessFailure(connectionID, "tcp", userFromContext(ctx), source, destination, startedAt, err)
+		_ = outbound.Close()
+		closeOnce(err)
+		_ = conn.Close()
+		return
+	}
 
 	h.config.logger.Info("anytls connection established",
 		zap.Uint64("connection_id", connectionID),
@@ -120,6 +131,13 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
+		closeOnce(err)
+		_ = conn.Close()
+		return
+	}
+	if err := reportHandshakeSuccess(conn); err != nil {
+		h.logHandshakeSuccessFailure(connectionID, "udp_over_tcp_v2", userFromContext(ctx), source, request.Destination, startedAt, err)
+		_ = packetConn.Close()
 		closeOnce(err)
 		_ = conn.Close()
 		return
@@ -262,6 +280,30 @@ func reportHandshakeFailure(conn net.Conn, err error) {
 	if reporter, ok := conn.(handshakeFailureReporter); ok {
 		_ = reporter.HandshakeFailure(err)
 	}
+}
+
+func reportHandshakeSuccess(conn net.Conn) error {
+	if reporter, ok := conn.(handshakeSuccessReporter); ok {
+		if err := reporter.HandshakeSuccess(); err != nil {
+			return fmt.Errorf("report handshake success: %w", err)
+		}
+	}
+	return nil
+}
+
+func (h *directTCPHandler) logHandshakeSuccessFailure(connectionID uint64, protocol string, user string, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, err error) {
+	h.config.logger.Warn("anytls handshake success report failed",
+		zap.Uint64("connection_id", connectionID),
+		zap.String("event", "anytls_handshake"),
+		zap.String("outcome", "error"),
+		zap.String("reason", "success_ack_failed"),
+		zap.String("protocol", protocol),
+		zap.String("user", user),
+		zap.String("source", source.String()),
+		zap.String("destination", destination.String()),
+		zap.Duration("duration", time.Since(startedAt)),
+		zap.Error(err),
+	)
 }
 
 func (h *directTCPHandler) dialResolved(ctx context.Context, address string) (net.Conn, error) {

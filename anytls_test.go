@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,6 +249,114 @@ func TestStreamLimits(t *testing.T) {
 
 	if wrapper.acquireStream(999) {
 		t.Fatal("stream for unknown session was accepted")
+	}
+}
+
+func TestHandlerReportsHandshakeSuccess(t *testing.T) {
+	reportErr := errors.New("send success acknowledgment")
+	tests := []struct {
+		name        string
+		destination M.Socksaddr
+		successErr  error
+		setup       func(t *testing.T, wrapper *ListenerWrapper)
+	}{
+		{
+			name:        "tcp success",
+			destination: M.ParseSocksaddr("service.example.internal:443"),
+			setup:       setupHandshakeSuccessTCP,
+		},
+		{
+			name:        "tcp report failure",
+			destination: M.ParseSocksaddr("service.example.internal:443"),
+			successErr:  reportErr,
+			setup:       setupHandshakeSuccessTCP,
+		},
+		{
+			name:        "udp over tcp success",
+			destination: M.ParseSocksaddr(uot.LegacyMagicAddress + ":443"),
+			setup:       setupHandshakeSuccessUDP,
+		},
+		{
+			name:        "udp over tcp report failure",
+			destination: M.ParseSocksaddr(uot.LegacyMagicAddress + ":443"),
+			successErr:  reportErr,
+			setup:       setupHandshakeSuccessUDP,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+			tt.setup(t, wrapper)
+
+			serverConn, clientConn := net.Pipe()
+			defer closeTest(serverConn)
+			defer closeTest(clientConn)
+			reportingConn := &handshakeReportConn{Conn: serverConn, successErr: tt.successErr}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx = contextWithConnectionID(ctx, 1)
+			wrapper.registerSession(1, reportingConn, cancel)
+			defer wrapper.unregisterSession(1)
+
+			closed := make(chan error, 1)
+			handler := &directTCPHandler{config: wrapper}
+			handler.NewConnectionEx(ctx, reportingConn, M.ParseSocksaddr("192.0.2.10:12345"), tt.destination, func(err error) {
+				closed <- err
+			})
+
+			if reportingConn.successCalls != 1 {
+				t.Fatalf("HandshakeSuccess() calls = %d, want 1", reportingConn.successCalls)
+			}
+			if tt.successErr != nil {
+				select {
+				case err := <-closed:
+					if !errors.Is(err, tt.successErr) {
+						t.Fatalf("close error = %v, want %v", err, tt.successErr)
+					}
+				default:
+					t.Fatal("handler did not close the stream after HandshakeSuccess() failed")
+				}
+				if wrapper.activeStreams != 0 {
+					t.Fatalf("active streams = %d, want 0", wrapper.activeStreams)
+				}
+				return
+			}
+
+			select {
+			case err := <-closed:
+				t.Fatalf("handler closed a successfully acknowledged stream: %v", err)
+			default:
+			}
+			closeTest(clientConn)
+			if !waitForCondition(time.Second, func() bool { return atomic.LoadInt64(&wrapper.activeStreams) == 0 }) {
+				t.Fatal("stream slot was not released after the connection closed")
+			}
+		})
+	}
+}
+
+func setupHandshakeSuccessTCP(t *testing.T, wrapper *ListenerWrapper) {
+	t.Helper()
+	targetConn, targetPeer := net.Pipe()
+	t.Cleanup(func() {
+		closeTest(targetConn)
+		closeTest(targetPeer)
+	})
+	wrapper.dialFunc = func(context.Context, string, string) (net.Conn, error) {
+		return targetConn, nil
+	}
+}
+
+func setupHandshakeSuccessUDP(t *testing.T, wrapper *ListenerWrapper) {
+	t.Helper()
+	packetConn, packetPeer := newPacketPipe()
+	t.Cleanup(func() {
+		closeTest(packetConn)
+		closeTest(packetPeer)
+	})
+	wrapper.listenPacketFunc = func(context.Context, string, string) (net.PacketConn, error) {
+		return packetConn, nil
 	}
 }
 

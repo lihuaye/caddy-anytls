@@ -173,6 +173,17 @@ func (c testTLSStateConn) ConnectionState() tls.ConnectionState {
 	return c.state
 }
 
+type handshakeReportConn struct {
+	net.Conn
+	successErr   error
+	successCalls int
+}
+
+func (c *handshakeReportConn) HandshakeSuccess() error {
+	c.successCalls++
+	return c.successErr
+}
+
 type anyTLSTestDialer struct {
 	client *singanytls.Client
 }
