@@ -3,6 +3,7 @@ package anytls
 import (
 	"context"
 	"net"
+	"net/netip"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -14,13 +15,14 @@ import (
 // caddy.listeners.anytls.outbounds namespace to route egress traffic elsewhere
 // (for example through a WireGuard tunnel to another exit host).
 //
-// Destination policy (private-target and CIDR/port/domain checks) and name
-// resolution are applied by the wrapper before the outbound is invoked, so an
-// Outbound only needs to move bytes.
+// Domain resolution is performed by the selected outbound and returned to the
+// wrapper for private-target and CIDR policy checks before dialing. This keeps
+// DNS and target traffic on the same egress path without weakening policy
+// enforcement.
 //
 // Contract for implementers:
 //
-//   - Both methods are called concurrently from many handler goroutines (one
+//   - All methods are called concurrently from many handler goroutines (one
 //     per AnyTLS connection); implementations must be safe for concurrent use.
 //   - Every returned net.Conn / net.PacketConn is owned and closed by the
 //     relay. Return a dedicated connection per call; never hand out shared or
@@ -28,10 +30,13 @@ import (
 //   - ctx carries the dial deadline and cancellation (connect_timeout);
 //     honor it during connection establishment.
 type Outbound interface {
+	// LookupNetIP resolves host through this outbound. Tunnel outbounds must
+	// send the DNS request through the tunnel rather than using the Caddy
+	// host's resolver. network follows net.Resolver.LookupNetIP semantics.
+	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 	// DialContext opens a stream connection to address for the given network
-	// (always "tcp" for AnyTLS TCP targets). The address is always an
-	// already-resolved "ip:port" — domains are resolved on the host running
-	// Caddy before the outbound is invoked.
+	// (always "tcp" for AnyTLS TCP targets). The address is an already-resolved
+	// "ip:port" returned by LookupNetIP and checked by the wrapper.
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	// ListenPacket opens a packet connection used for UDP-over-TCP relaying.
 	// network is "udp" and address is empty to request an ephemeral socket.
@@ -66,6 +71,13 @@ func (*DirectOutbound) CaddyModule() caddy.ModuleInfo {
 		ID:  "caddy.listeners.anytls.outbounds.direct",
 		New: func() caddy.Module { return new(DirectOutbound) },
 	}
+}
+
+// LookupNetIP resolves host using the Caddy host's resolver. This is correct
+// for the direct outbound because DNS and target traffic use the same local
+// egress path.
+func (*DirectOutbound) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, network, host)
 }
 
 // DialContext dials directly using the default dialer. The caller is

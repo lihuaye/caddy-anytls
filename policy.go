@@ -68,7 +68,7 @@ func (h *directTCPHandler) validateDestination(ctx context.Context, destination 
 		// No CIDR policy applies, but still resolve here so the Outbound
 		// contract holds unconditionally: outbounds always receive an
 		// already-resolved "ip:port", never a domain. Only the policy check
-		// is skipped, not host-side resolution.
+		// is skipped, not resolution through the selected outbound.
 		return h.resolveDestination(ctx, destination)
 	}
 	resolvedDestinations, err := h.resolveDestination(ctx, destination)

@@ -152,7 +152,7 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
   "node_sni": "example.com",
   "node_insecure": false,
   "outbounds": {
-    "wg-home": {"dialer": "wireguard", "endpoint": "home.example.com:51820"}
+    "wg-home": {"dialer": "wireguard", "tunnel": "home"}
   },
   "default_outbound": "wg-home",
   "users": [
@@ -206,7 +206,7 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 
 ## 出站扩展点
 
-出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。模块需实现 `Outbound` 接口（`DialContext` + `ListenPacket`，见 `outbound.go`）。未配置或配置为 `null` 时回退到内置 `direct` 出站（本地网络栈直连）。
+出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。模块需实现 `Outbound` 接口（`LookupNetIP` + `DialContext` + `ListenPacket`，见 `outbound.go`）。未配置或配置为 `null` 时回退到内置 `direct` 出站（本地网络栈直连）。
 
 ### 按用户选择出站
 
@@ -224,11 +224,14 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 
 ### 职责边界
 
-认证、目标策略校验（私网/端口/域名/CIDR）与**宿主机域名解析**全部由 wrapper 在调用出站之前完成——包括 `allow_private_targets` 开启且无 CIDR 规则的快速路径（该路径只跳过策略校验，不跳过解析）。因此出站模块只负责搬字节：`DialContext` 收到的 address 永远是已解析的 `ip:port`，绝不会是域名。这对基于 netstack 的隧道出站（如 WireGuard，其内部无法使用宿主机解析器）是必要保证。
+域名解析由认证用户实际选中的出站执行。`direct` 使用宿主机解析器；隧道出站必须通过隧道内可达的 DNS 服务器解析，不能静默回落到宿主机 DNS。解析结果返回 wrapper 后，再执行私网/端口/域名/CIDR 策略校验；只有全部地址通过检查，才会将已解析的 `ip:port` 交给同一个出站拨号。这样既保证 DNS 与目标连接使用同一出口，也不会牺牲 SSRF 防护。
+
+WireGuard 等物理隧道资源应由对应插件在全局 App 中集中定义；AnyTLS 出站只保存对隧道名的引用。这样同一 device 可以被多个 AnyTLS 逻辑出口或 `reverse_proxy` transport 共享，不会因为重复内联同一密钥而创建互相抢占 endpoint 的设备。
 
 ### 实现契约
 
-- 两个方法会被多个 handler goroutine 并发调用（每条 AnyTLS 连接一个），实现必须并发安全。
+- 三个方法会被多个 handler goroutine 并发调用（每条 AnyTLS 连接一个），实现必须并发安全。
+- `LookupNetIP` 必须通过该出站的网络路径解析，并遵循 `ctx` 的截止时间和取消信号；不得为了兼容性回落到宿主机 DNS。
 - 返回的 `net.Conn` / `net.PacketConn` 由 relay 负责关闭；每次调用必须返回独立连接，不得返回共享或缓存的连接。
 - `ctx` 携带 `connect_timeout` 的截止时间与取消信号，建连期间必须遵守。
 - `ListenPacket` 返回的连接按非 connected 方式使用：relay 会用 `WriteTo` 发往任意已解析的 UDP 目标。

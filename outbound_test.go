@@ -26,9 +26,26 @@ type recordingOutbound struct {
 	inner         Outbound
 	mu            sync.Mutex
 	dialed        []string
+	lookedUp      []string
+	lookup        func(context.Context, string, string) ([]netip.Addr, error)
 	packetNetwork string
 	packetAddress string
 	packetConn    net.PacketConn
+}
+
+func (o *recordingOutbound) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	o.mu.Lock()
+	o.lookedUp = append(o.lookedUp, host)
+	lookup := o.lookup
+	inner := o.inner
+	o.mu.Unlock()
+	if lookup != nil {
+		return lookup(ctx, network, host)
+	}
+	if inner == nil {
+		return nil, errors.New("lookup not configured")
+	}
+	return inner.LookupNetIP(ctx, network, host)
 }
 
 func (o *recordingOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -56,6 +73,12 @@ func (o *recordingOutbound) dials() []string {
 	return append([]string(nil), o.dialed...)
 }
 
+func (o *recordingOutbound) lookups() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.lookedUp...)
+}
+
 type stubPacketConn struct{}
 
 func (*stubPacketConn) ReadFrom([]byte) (int, net.Addr, error)    { return 0, nil, io.EOF }
@@ -67,6 +90,10 @@ func (*stubPacketConn) SetReadDeadline(time.Time) error           { return nil }
 func (*stubPacketConn) SetWriteDeadline(time.Time) error          { return nil }
 
 type blockingOutbound struct{}
+
+func (*blockingOutbound) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return nil, errors.New("not implemented")
+}
 
 func (*blockingOutbound) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
 	<-ctx.Done()
@@ -150,6 +177,22 @@ func TestDirectOutboundListenPacket(t *testing.T) {
 
 	if _, ok := packetConn.LocalAddr().(*net.UDPAddr); !ok {
 		t.Fatalf("LocalAddr() = %T, want *net.UDPAddr", packetConn.LocalAddr())
+	}
+}
+
+func TestDirectOutboundLookupNetIP(t *testing.T) {
+	var outbound DirectOutbound
+	addresses, err := outbound.LookupNetIP(context.Background(), "ip", "localhost")
+	if err != nil {
+		t.Fatalf("LookupNetIP() error = %v", err)
+	}
+	if len(addresses) == 0 {
+		t.Fatal("LookupNetIP() returned no localhost addresses")
+	}
+	for _, address := range addresses {
+		if !address.IsValid() {
+			t.Fatalf("LookupNetIP() returned invalid address %v", address)
+		}
 	}
 }
 
@@ -357,10 +400,9 @@ func TestHandlerOutboundDialPropagatesCancellation(t *testing.T) {
 	}
 }
 
-// Domains must be resolved on the host running Caddy before the outbound is
-// invoked, even on the allow_private_targets fast path that skips CIDR policy
-// checks — the Outbound contract promises an already-resolved "ip:port".
-func TestHandlerResolvesDomainBeforeOutbound(t *testing.T) {
+// Domain lookup and dialing must use the same per-user outbound. The outbound
+// still receives a resolved ip:port for policy enforcement and happy-eyeballs.
+func TestHandlerResolvesDomainThroughSelectedOutbound(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("net.Listen() error = %v", err)
@@ -368,19 +410,26 @@ func TestHandlerResolvesDomainBeforeOutbound(t *testing.T) {
 	defer closeTest(listener)
 	go acceptLoop(context.Background(), listener)
 
-	recorder := &recordingOutbound{inner: new(DirectOutbound)}
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
-	wrapper.outbound = recorder
-	wrapper.resolveFunc = func(_ context.Context, _ string, host string) ([]netip.Addr, error) {
-		if host != "internal.test" {
-			t.Errorf("resolveFunc host = %q, want %q", host, "internal.test")
-		}
-		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	recorder := &recordingOutbound{
+		inner: new(DirectOutbound),
+		lookup: func(_ context.Context, network, host string) ([]netip.Addr, error) {
+			if network != "ip" {
+				t.Errorf("LookupNetIP network = %q, want ip", network)
+			}
+			if host != "internal.test" {
+				t.Errorf("LookupNetIP host = %q, want internal.test", host)
+			}
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		},
 	}
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.userOutbound = map[string]Outbound{"alice": recorder}
+	wrapper.userOutboundName = map[string]string{"alice": "wg-home"}
 
 	port := listener.Addr().(*net.TCPAddr).Port
 	handler := &directTCPHandler{config: wrapper}
-	conn, err := handler.dialContext(context.Background(), M.Socksaddr{Fqdn: "internal.test", Port: uint16(port)})
+	ctx := auth.ContextWithUser(context.Background(), "alice")
+	conn, err := handler.dialContext(ctx, M.Socksaddr{Fqdn: "internal.test", Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("dialContext() error = %v", err)
 	}
@@ -390,6 +439,63 @@ func TestHandlerResolvesDomainBeforeOutbound(t *testing.T) {
 	dials := recorder.dials()
 	if len(dials) != 1 || dials[0] != want {
 		t.Fatalf("recorded dials = %v, want [%s] (outbound must receive a resolved ip:port, not a domain)", dials, want)
+	}
+	if lookups := recorder.lookups(); len(lookups) != 1 || lookups[0] != "internal.test" {
+		t.Fatalf("recorded lookups = %v, want [internal.test]", lookups)
+	}
+}
+
+func TestResolveDestinationSelectsPerUserOutboundResolver(t *testing.T) {
+	newResolver := func(address string) *recordingOutbound {
+		return &recordingOutbound{
+			lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr(address)}, nil
+			},
+		}
+	}
+
+	recA := newResolver("192.0.2.10")
+	recB := newResolver("192.0.2.20")
+	recDefault := newResolver("192.0.2.30")
+	wrapper := newTestWrapper(t, []User{
+		{Name: "alice", Password: "a-pw", Enabled: true, Outbound: "wg-a"},
+		{Name: "bob", Password: "b-pw", Enabled: true, Outbound: "wg-b"},
+		{Name: "carol", Password: "c-pw", Enabled: true},
+	}, true)
+	wrapper.userOutbound = map[string]Outbound{"alice": recA, "bob": recB}
+	wrapper.userOutboundName = map[string]string{"alice": "wg-a", "bob": "wg-b"}
+	wrapper.defaultOutbound = recDefault
+	wrapper.defaultOutboundName = "wg-default"
+	handler := &directTCPHandler{config: wrapper}
+
+	for _, tt := range []struct {
+		user string
+		want string
+	}{
+		{user: "alice", want: "192.0.2.10:443"},
+		{user: "bob", want: "192.0.2.20:443"},
+		{user: "carol", want: "192.0.2.30:443"},
+	} {
+		destinations, err := handler.resolveDestination(
+			auth.ContextWithUser(context.Background(), tt.user),
+			M.Socksaddr{Fqdn: "service.test", Port: 443},
+		)
+		if err != nil {
+			t.Fatalf("resolveDestination(%s) error = %v", tt.user, err)
+		}
+		if len(destinations) != 1 || destinations[0].String() != tt.want {
+			t.Fatalf("resolveDestination(%s) = %v, want [%s]", tt.user, destinations, tt.want)
+		}
+	}
+
+	if lookups := recA.lookups(); len(lookups) != 1 || lookups[0] != "service.test" {
+		t.Fatalf("alice resolver lookups = %v, want [service.test]", lookups)
+	}
+	if lookups := recB.lookups(); len(lookups) != 1 || lookups[0] != "service.test" {
+		t.Fatalf("bob resolver lookups = %v, want [service.test]", lookups)
+	}
+	if lookups := recDefault.lookups(); len(lookups) != 1 || lookups[0] != "service.test" {
+		t.Fatalf("default resolver lookups = %v, want [service.test]", lookups)
 	}
 }
 
@@ -417,6 +523,10 @@ type gateDialOutbound struct {
 	conns   []*trackedConn
 	entered chan struct{}
 	release chan struct{}
+}
+
+func (*gateDialOutbound) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (o *gateDialOutbound) DialContext(context.Context, string, string) (net.Conn, error) {

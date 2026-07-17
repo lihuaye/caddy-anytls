@@ -214,21 +214,28 @@ xcaddy build \
     --with github.com/lihuaye/caddy-wireguard
 ```
 
-再在 `anytls` 块中配置出站：
+WireGuard 的密钥、端点、地址和 DNS 属于出口资源，先在全局块中定义命名隧道；`anytls` 只引用它：
 
 ```caddyfile
 {
+    wireguard {
+        tunnel home {
+            private_key          <base64 客户端私钥>
+            peer_public_key      <base64 服务端公钥>
+            endpoint             home.example.com:51820
+            address              10.7.0.2
+            allowed_ips          0.0.0.0/0 ::/0
+            dns                  1.1.1.1
+            persistent_keepalive 25
+        }
+    }
+
     servers :443 {
         listener_wrappers {
             anytls {
                 user phone-1 replace-with-strong-password
                 outbound wireguard {
-                    private_key          <base64 客户端私钥>
-                    peer_public_key      <base64 服务端公钥>
-                    endpoint             home.example.com:51820
-                    address              10.7.0.2
-                    allowed_ips          0.0.0.0/0 ::/0
-                    persistent_keepalive 25
+                    tunnel home
                 }
             }
         }
@@ -243,15 +250,18 @@ example.com {
 行为说明：
 
 - 入口（客户端到 `:443`）路径不受影响，隧道只承载认证后的出口流量
-- 目标策略与域名解析仍在出站之前完成
-- 域名由运行 Caddy 的宿主机解析；远端出口或隧道内 DNS 不参与目标域名解析
+- 域名由实际选中的出站解析；WireGuard 出站的 DNS 请求经 `home` 隧道发送到其配置的解析器
+- 解析结果返回 wrapper 完成私网/CIDR 策略检查，再由同一个出站连接已检查的 IP
 - 不写 `outbound` 时使用内置 `direct`，等价于原有直连行为
+- 推荐使用全局命名隧道，不在 `anytls` 内重复内联密钥和 endpoint；同一隧道还可安全共享给 `reverse_proxy`
 
 配置项、密钥生成和家宽侧准备见 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard) 的 README。
 
 ## 按用户选择出站（多出站）
 
 同一个 `:443` 入口可以声明多个具名出站，并让不同账号走不同出口。客户端只需要配置多个「节点」（同 IP、同端口、同 SNI、单证书，仅密码不同）即可切换出口。
+
+下例继续引用上一个示例在全局块中定义的 `home` 隧道：
 
 ```caddyfile
 {
@@ -260,11 +270,7 @@ example.com {
             anytls {
                 # 具名出站：outbound <name> <module> { ...模块配置... }
                 outbound wg-home wireguard {
-                    private_key     <base64 客户端私钥>
-                    peer_public_key <base64 服务端公钥>
-                    endpoint        home.example.com:51820
-                    address         10.7.0.2
-                    allowed_ips     0.0.0.0/0 ::/0
+                    tunnel home
                 }
 
                 # 默认出站（可选）：未标注出站的用户走它
@@ -291,6 +297,7 @@ example.com {
 - 默认出站解析顺序：`default_outbound` 指定的具名出站 → 单 `outbound` 模块 → 内置 `direct`。老配置（只有单 `outbound` 或什么都不写）行为完全不变。
 - 保留名 `direct` 与 `default` 不允许在具名出站中声明。`direct` 始终指向内置直连出站，无需声明即可被 `user` 引用；`default` 是旧式单 `outbound` 默认档在日志中的哨兵名。
 - 引用未声明的出站名、具名出站重名、`default_outbound` 指令重复出现均会在配置阶段报错。
+- TCP 与 UDP-over-TCP 的域名解析都由该用户最终选中的出站完成；解析、策略检查和拨号共享同一个连接上下文与超时预算。
 
 对应的 JSON 配置：
 
@@ -300,7 +307,7 @@ example.com {
   "outbounds": {
     "wg-home": {
       "dialer": "wireguard",
-      "endpoint": "home.example.com:51820"
+      "tunnel": "home"
     }
   },
   "default_outbound": "wg-home",
