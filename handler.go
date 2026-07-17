@@ -377,8 +377,8 @@ func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M
 	}
 	resolveFunc := h.config.resolveFunc
 	if resolveFunc == nil {
-		resolver := net.DefaultResolver
-		resolveFunc = resolver.LookupNetIP
+		outbound, _ := h.outboundForUser(ctx)
+		resolveFunc = outbound.LookupNetIP
 	}
 	addresses, err := resolveFunc(ctx, "ip", destination.Fqdn)
 	if err != nil {

@@ -26,8 +26,8 @@ import (
 
 // testResolvedDestinationAddress is what fixtures expect their dialFunc to
 // receive for a :443 domain destination resolved through resolveTestDomain:
-// destinations are always resolved on the host before reaching the outbound,
-// even on the allow_private_targets fast path.
+// destinations are always resolved and policy-checked before dialing through
+// the outbound, even on the allow_private_targets fast path.
 const testResolvedDestinationAddress = "192.0.2.10:443"
 
 func resolveTestDomain(context.Context, string, string) ([]netip.Addr, error) {

@@ -207,7 +207,7 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context, hasSingleO
 	// injected, otherwise the injection would shadow a user declaration.
 	for name := range lw.OutboundsRaw {
 		if name == "" {
-			return fmt.Errorf("named outbound must not have an empty name")
+			return errors.New("named outbound must not have an empty name")
 		}
 		if name == reservedOutboundDirect || name == reservedOutboundDefault {
 			return fmt.Errorf("outbound name %q is reserved", name)
@@ -220,7 +220,11 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context, hasSingleO
 		if err != nil {
 			return fmt.Errorf("load named outbound modules: %w", err)
 		}
-		for name, mod := range mods.(map[string]any) {
+		outboundMods, ok := mods.(map[string]any)
+		if !ok {
+			return fmt.Errorf("named outbound modules loaded as unexpected type %T", mods)
+		}
+		for name, mod := range outboundMods {
 			outbound, ok := mod.(Outbound)
 			if !ok {
 				return fmt.Errorf("named outbound %q: configured module %T is not an anytls outbound", name, mod)

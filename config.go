@@ -215,35 +215,26 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if _, ok := lw.OutboundsRaw[outboundName]; ok {
 					return d.Errf("outbound %q may only be declared once", outboundName)
 				}
-				modID := "caddy.listeners.anytls.outbounds." + moduleName
-				unm, err := caddyfile.UnmarshalModule(d, modID)
+				raw, err := unmarshalOutboundModule(d, moduleName)
 				if err != nil {
 					return err
-				}
-				if _, ok := unm.(Outbound); !ok {
-					return d.Errf("module %s is not an anytls outbound", modID)
 				}
 				if lw.OutboundsRaw == nil {
 					lw.OutboundsRaw = make(map[string]json.RawMessage)
 				}
-				lw.OutboundsRaw[outboundName] = caddyconfig.JSONModuleObject(unm, "dialer", moduleName, nil)
-				break
+				lw.OutboundsRaw[outboundName] = raw
+			} else {
+				// Default form: firstArg is the module name. Only the unnamed
+				// form is limited to a single occurrence.
+				if len(lw.OutboundRaw) != 0 {
+					return d.Errf("outbound may only be specified once")
+				}
+				raw, err := unmarshalOutboundModule(d, firstArg)
+				if err != nil {
+					return err
+				}
+				lw.OutboundRaw = raw
 			}
-			// Default form: firstArg is the module name. Only the unnamed form
-			// is limited to a single occurrence.
-			if len(lw.OutboundRaw) != 0 {
-				return d.Errf("outbound may only be specified once")
-			}
-			moduleName := firstArg
-			modID := "caddy.listeners.anytls.outbounds." + moduleName
-			unm, err := caddyfile.UnmarshalModule(d, modID)
-			if err != nil {
-				return err
-			}
-			if _, ok := unm.(Outbound); !ok {
-				return d.Errf("module %s is not an anytls outbound", modID)
-			}
-			lw.OutboundRaw = caddyconfig.JSONModuleObject(unm, "dialer", moduleName, nil)
 
 		case "default_outbound":
 			if lw.DefaultOutbound != "" {
@@ -266,6 +257,21 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 
 	return nil
+}
+
+// unmarshalOutboundModule parses one outbound module body starting at the
+// current dispenser position (the module-name token) and returns it in the
+// JSON object form stored in the outbound raw fields.
+func unmarshalOutboundModule(d *caddyfile.Dispenser, moduleName string) (json.RawMessage, error) {
+	modID := "caddy.listeners.anytls.outbounds." + moduleName
+	unm, err := caddyfile.UnmarshalModule(d, modID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := unm.(Outbound); !ok {
+		return nil, d.Errf("module %s is not an anytls outbound", modID)
+	}
+	return caddyconfig.JSONModuleObject(unm, "dialer", moduleName, nil), nil
 }
 
 // UnmarshalJSON preserves explicit false values for booleans with non-zero

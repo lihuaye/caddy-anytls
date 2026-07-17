@@ -193,16 +193,31 @@ example.com {
 
 认证通过后，目标流量默认由运行 Caddy 的这台机器直接发出（内置 `direct` 出站）。你也可以用 `outbound` 指令切换到其它出站模块，把出口流量转发到别处，例如经 WireGuard 隧道从另一台家宽服务器出站，用住宅 IP 出网。
 
+WireGuard 的密钥、端点和隧道地址属于出口资源，应在 `caddy-wireguard` 的全局配置中集中定义；`anytls` 只引用该隧道：
+
 ```caddyfile
-anytls {
-    user phone-1 replace-with-strong-password
-    outbound wireguard {
-        private_key     <base64 客户端私钥>
-        peer_public_key <base64 服务端公钥>
-        endpoint        home.example.com:51820
-        address         10.7.0.2
-        allowed_ips     0.0.0.0/0 ::/0
-        persistent_keepalive 25
+{
+    wireguard {
+        tunnel home {
+            private_key          <base64 客户端私钥>
+            peer_public_key      <base64 服务端公钥>
+            endpoint             home.example.com:51820
+            address              10.7.0.2
+            allowed_ips          0.0.0.0/0 ::/0
+            dns                  1.1.1.1
+            persistent_keepalive 25
+        }
+    }
+
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                user phone-1 replace-with-strong-password
+                outbound wireguard {
+                    tunnel home
+                }
+            }
+        }
     }
 }
 ```
@@ -212,11 +227,7 @@ anytls {
 ```caddyfile
 anytls {
     outbound wg-home wireguard {
-        private_key     <base64 客户端私钥>
-        peer_public_key <base64 服务端公钥>
-        endpoint        home.example.com:51820
-        address         10.7.0.2
-        allowed_ips     0.0.0.0/0 ::/0
+        tunnel home
     }
     default_outbound wg-home
 
@@ -230,8 +241,9 @@ anytls {
 - 保留名 `direct` 和 `default` 不允许作为具名出站的名字；引用未声明的出站名会在配置阶段报错。
 - 未标注出站的用户按 `default_outbound` → 单 `outbound` → 内置 `direct` 的顺序解析默认出口，老配置行为不变。
 - 连接建立日志（`anytls connection established`）与节点日志带 `outbound` 字段，标注该连接/该账号实际使用的出站名。
-- 目标策略（私网拒绝、CIDR/端口/域名规则）和域名解析仍在出站之前完成，出站模块只负责搬运字节。
-- 域名使用运行 Caddy 的宿主机 DNS 解析后再交给出站模块；当前不支持由远端出口或隧道内 DNS 解析目标域名。
+- 域名由认证用户实际选中的出站解析：`direct` 使用宿主机 DNS，隧道出站必须让 DNS 请求经过隧道。
+- 出站把解析结果返回 wrapper；wrapper 在拨号前完成私网、CIDR、端口和域名策略校验，然后通过同一出站连接已校验的 IP。
+- 推荐在全局块集中配置 WireGuard 隧道，再在 `anytls` 中通过 `tunnel <name>` 引用；这也允许 `reverse_proxy` 等其它模块安全共享同一个 device。
 - WireGuard 出站是一个独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)，用户态实现（wireguard-go + netstack），无需内核模块、TUN 设备或 root。构建方式：
 
 ```sh
