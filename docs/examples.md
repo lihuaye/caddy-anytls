@@ -169,6 +169,7 @@ example.com {
 - 域名目标会先解析再执行私网和 CIDR 策略
 - TCP 域名目标解析出多个地址时，会在统一超时预算内交错 IPv4/IPv6 并发尝试
 - `allow_cidr`、`deny_cidr`、`allow_port`、`deny_port`、`allow_domain`、`deny_domain` 可组合限制出站目标
+- 可声明多个具名出站并按用户选择出口（TCP 与 UDP over TCP 均生效），见下文「按用户选择出站」
 
 ## 节点信息输出
 
@@ -200,6 +201,130 @@ URI 规则：
 - 端口省略时默认为 `443`
 - `ANYTLS_SNI` 与服务端地址不同时会输出 `sni` 参数
 - `ANYTLS_SKIP_CERT_VERIFY=true` 时会输出 `insecure=1`
+
+## 出站转发到其它出口（WireGuard）
+
+默认情况下认证后的目标流量从运行 Caddy 的机器直接发出。若希望出口流量从另一台主机（例如家宽服务器）出网，可用 `outbound` 指令切换出站模块。
+
+先按同时包含主模块和 WireGuard 出站插件的方式构建（WireGuard 出站是独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)）：
+
+```sh
+xcaddy build \
+    --with github.com/evaneonf/caddy-anytls \
+    --with github.com/lihuaye/caddy-wireguard
+```
+
+WireGuard 的密钥、端点、地址和 DNS 属于出口资源，先在全局块中定义命名隧道；`anytls` 只引用它：
+
+```caddyfile
+{
+    wireguard {
+        tunnel home {
+            private_key          <base64 客户端私钥>
+            peer_public_key      <base64 服务端公钥>
+            endpoint             home.example.com:51820
+            address              10.7.0.2
+            allowed_ips          0.0.0.0/0 ::/0
+            dns                  1.1.1.1
+            persistent_keepalive 25
+        }
+    }
+
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                user phone-1 replace-with-strong-password
+                outbound wireguard {
+                    tunnel home
+                }
+            }
+        }
+    }
+}
+
+example.com {
+    respond "server is running"
+}
+```
+
+行为说明：
+
+- 入口（客户端到 `:443`）路径不受影响，隧道只承载认证后的出口流量
+- 域名由实际选中的出站解析；WireGuard 出站的 DNS 请求经 `home` 隧道发送到其配置的解析器
+- 解析结果返回 wrapper 完成私网/CIDR 策略检查，再由同一个出站连接已检查的 IP
+- 不写 `outbound` 时使用内置 `direct`，等价于原有直连行为
+- 推荐使用全局命名隧道，不在 `anytls` 内重复内联密钥和 endpoint；同一隧道还可安全共享给 `reverse_proxy`
+
+配置项、密钥生成和家宽侧准备见 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard) 的 README。
+
+## 按用户选择出站（多出站）
+
+同一个 `:443` 入口可以声明多个具名出站，并让不同账号走不同出口。客户端只需要配置多个「节点」（同 IP、同端口、同 SNI、单证书，仅密码不同）即可切换出口。
+
+下例继续引用上一个示例在全局块中定义的 `home` 隧道：
+
+```caddyfile
+{
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                # 具名出站：outbound <name> <module> { ...模块配置... }
+                outbound wg-home wireguard {
+                    tunnel home
+                }
+
+                # 默认出站（可选）：未标注出站的用户走它
+                default_outbound wg-home
+
+                # user <name> <password> [outbound-name]
+                user phone-home   replace-with-password-1          # -> 默认（wg-home）
+                user phone-direct replace-with-password-2 direct   # -> 内置直连
+                user laptop       replace-with-password-3 wg-home  # 显式引用
+            }
+        }
+    }
+}
+
+example.com {
+    respond "server is running"
+}
+```
+
+规则说明：
+
+- `outbound <name> <module>`（2 个参数）声明具名出站；`outbound <module>`（1 个参数）仍是原有的单默认出站写法，语义不变。
+- `user` 的第 3 个参数按名引用某个具名出站，省略时走默认出站。
+- 默认出站解析顺序：`default_outbound` 指定的具名出站 → 单 `outbound` 模块 → 内置 `direct`。老配置（只有单 `outbound` 或什么都不写）行为完全不变。
+- 保留名 `direct` 与 `default` 不允许在具名出站中声明。`direct` 始终指向内置直连出站，无需声明即可被 `user` 引用；`default` 是旧式单 `outbound` 默认档在日志中的哨兵名。
+- 引用未声明的出站名、具名出站重名、`default_outbound` 指令重复出现均会在配置阶段报错。
+- TCP 与 UDP-over-TCP 的域名解析都由该用户最终选中的出站完成；解析、策略检查和拨号共享同一个连接上下文与超时预算。
+
+对应的 JSON 配置：
+
+```json
+{
+  "wrapper": "anytls",
+  "outbounds": {
+    "wg-home": {
+      "dialer": "wireguard",
+      "tunnel": "home"
+    }
+  },
+  "default_outbound": "wg-home",
+  "users": [
+    {"name": "phone-home", "password": "..."},
+    {"name": "phone-direct", "password": "...", "outbound": "direct"},
+    {"name": "laptop", "password": "...", "outbound": "wg-home"}
+  ]
+}
+```
+
+注意：JSON 的 `outbounds` 是对象，重复键会被 JSON 解析器静默取后者，重名检测仅在 Caddyfile 路径可用。
+
+可观测性：
+
+- Info 级 `anytls connection established` 日志带 `outbound` 字段，记录该连接实际使用的出站名（具名引用或 `default_outbound` 命中时为其名；`direct` 引用或兜底为 `direct`；旧式单 `outbound` 默认档为哨兵 `default`）。
+- 开启 `log_node_info` 时，每个用户的节点日志同样带 `outbound` 字段，便于核对哪个账号走哪个出口。
 
 ## 已知限制
 

@@ -31,6 +31,10 @@ func (lw *ListenerWrapper) logNodeInfo(server *caddyhttp.Server) {
 		if !user.Enabled {
 			continue
 		}
+		outboundName := user.Outbound
+		if outboundName == "" {
+			_, outboundName = lw.resolveDefaultOutbound()
+		}
 		for _, host := range hosts {
 			sni := lw.NodeSNI
 			if sni == "" {
@@ -39,6 +43,7 @@ func (lw *ListenerWrapper) logNodeInfo(server *caddyhttp.Server) {
 			lw.logger.Info("anytls node available",
 				zap.String("event", "anytls_node"),
 				zap.String("user", user.Name),
+				zap.String("outbound", outboundName),
 				zap.String("host", host),
 				zap.Uint16("port", port),
 				zap.String("sni", sni),

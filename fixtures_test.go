@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,16 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+// testResolvedDestinationAddress is what fixtures expect their dialFunc to
+// receive for a :443 domain destination resolved through resolveTestDomain:
+// destinations are always resolved and policy-checked before dialing through
+// the outbound, even on the allow_private_targets fast path.
+const testResolvedDestinationAddress = "192.0.2.10:443"
+
+func resolveTestDomain(context.Context, string, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+}
 
 func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *ListenerWrapper {
 	t.Helper()
@@ -37,6 +48,7 @@ func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *Liste
 		PaddingScheme:       string(padding.DefaultPaddingScheme),
 		logger:              zap.NewNop(),
 		registry:            newSessionRegistry(),
+		outbound:            new(DirectOutbound),
 	}
 	wrapper.detector = NewPasswordHashDetector(wrapper.Users)
 
@@ -52,6 +64,31 @@ func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *Liste
 	wrapper.service = service
 
 	return wrapper
+}
+
+// newTestAnyTLSClient builds a sing-anytls client whose outgoing connections
+// are enqueued on the given chanListener, mirroring the inline client setup
+// used across the integration tests.
+func newTestAnyTLSClient(t *testing.T, base *chanListener, password string) *singanytls.Client {
+	t.Helper()
+
+	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+		Password:                 password,
+		IdleSessionCheckInterval: 100 * time.Millisecond,
+		IdleSessionTimeout:       time.Second,
+		MinIdleSession:           0,
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			serverConn, clientConn := net.Pipe()
+			base.enqueue(serverConn)
+			return clientConn, nil
+		},
+		Logger: zapLogger{base: zap.NewNop()},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { closeTest(client) })
+	return client
 }
 
 func newTestCertificate(t *testing.T) tls.Certificate {

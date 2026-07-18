@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -337,6 +338,7 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 
 func setupHandshakeSuccessTCP(t *testing.T, wrapper *ListenerWrapper) {
 	t.Helper()
+	wrapper.resolveFunc = resolveTestDomain
 	targetConn, targetPeer := net.Pipe()
 	t.Cleanup(func() {
 		closeTest(targetConn)
@@ -689,8 +691,9 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -800,8 +803,9 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -894,8 +898,9 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 	destination := newChanListener()
 	defer closeTest(destination)
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.resolveFunc = resolveTestDomain
 	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -1270,8 +1275,9 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	defer closeTest(destination)
 	proxyWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
 	proxyWrapper.logger = logger2
+	proxyWrapper.resolveFunc = resolveTestDomain
 	proxyWrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
+		if address != testResolvedDestinationAddress {
 			return nil, errors.New("unexpected destination address")
 		}
 		serverConn, clientConn := net.Pipe()
@@ -1354,97 +1360,200 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	}
 }
 
+// Config unload must terminate active sessions through the production hook:
+// the wrapper's caddy.CleanerUpper Cleanup() method. (Callbacks registered
+// with ctx.OnCancel in Provision never run in caddy v2.11.4, so this test
+// deliberately goes through Cleanup instead of calling closeActiveSessions
+// directly.) The wrapper carries two named outbounds with one in-flight
+// session each, covering multi-outbound cleanup.
 func TestReloadStyleClosesExistingSessions(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
-	destinationAddress := "service.example.internal:443"
-	destination := newChanListener()
-	defer closeTest(destination)
-
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
-	wrapper.logger = logger
-	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != destinationAddress {
-			return nil, errors.New("unexpected destination address")
-		}
-		serverConn, clientConn := net.Pipe()
-		destination.enqueue(serverConn)
-		return clientConn, nil
-	}
-	service, err := singanytls.NewService(singanytls.ServiceConfig{
-		PaddingScheme: []byte(wrapper.PaddingScheme),
-		Users:         wrapper.anyTLSUsers(),
-		Handler:       &directTCPHandler{config: wrapper},
-		Logger:        zapLogger{base: logger},
-	})
+	destination, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("NewService() error = %v", err)
+		t.Fatalf("net.Listen() error = %v", err)
 	}
-	wrapper.service = service
-
-	destReady := make(chan net.Conn, 1)
+	defer closeTest(destination)
+	var destMu sync.Mutex
+	var destConns []net.Conn
 	go func() {
-		conn, err := destination.Accept()
-		if err != nil {
-			return
+		for {
+			conn, acceptErr := destination.Accept()
+			if acceptErr != nil {
+				return
+			}
+			destMu.Lock()
+			destConns = append(destConns, conn)
+			destMu.Unlock()
 		}
-		destReady <- conn
 	}()
+	defer func() {
+		destMu.Lock()
+		defer destMu.Unlock()
+		for _, conn := range destConns {
+			_ = conn.Close()
+		}
+	}()
+	destinationAddress := destination.Addr().String()
+
+	users := []User{
+		{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "wg-a"},
+		{Name: "bob", Password: "bob-pass", Enabled: true, Outbound: "wg-b"},
+	}
+	wrapper := newTestWrapper(t, users, true)
+	wrapper.logger = logger
+	recA := &recordingOutbound{inner: new(DirectOutbound)}
+	recB := &recordingOutbound{inner: new(DirectOutbound)}
+	wrapper.namedOutbounds = map[string]Outbound{"wg-a": recA, "wg-b": recB, "direct": new(DirectOutbound)}
+	wrapper.userOutbound = map[string]Outbound{"alice": recA, "bob": recB}
+	wrapper.userOutboundName = map[string]string{"alice": "wg-a", "bob": "wg-b"}
 
 	base := newChanListener()
 	defer closeTest(base)
-	go acceptLoop(context.Background(), wrapper.WrapListener(base))
+	go acceptLoop(t.Context(), wrapper.WrapListener(base))
 
-	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
-		Password:                 "secret",
-		IdleSessionCheckInterval: 100 * time.Millisecond,
-		IdleSessionTimeout:       time.Second,
-		MinIdleSession:           0,
-		DialOut: func(ctx context.Context) (net.Conn, error) {
-			serverConn, clientConn := net.Pipe()
-			base.enqueue(serverConn)
-			return clientConn, nil
-		},
-		Logger: zapLogger{base: zap.NewNop()},
-	})
+	proxyConns := make([]net.Conn, 0, len(users))
+	for _, user := range users {
+		client := newTestAnyTLSClient(t, base, user.Password)
+		proxyConn, err := client.CreateProxy(t.Context(), M.ParseSocksaddr(destinationAddress))
+		if err != nil {
+			t.Fatalf("CreateProxy(%s) error = %v", user.Name, err)
+		}
+		defer closeTest(proxyConn)
+		proxyConns = append(proxyConns, proxyConn)
+
+		if _, err := io.WriteString(proxyConn, "hold-open\n"); err != nil {
+			t.Fatalf("WriteString(%s) error = %v", user.Name, err)
+		}
+	}
+
+	if !waitForCondition(time.Second, func() bool { return wrapper.activeSessionCount() == 2 }) {
+		t.Fatalf("active sessions = %d, want 2", wrapper.activeSessionCount())
+	}
+	// The server-side dial completes asynchronously after the stream request.
+	if !waitForCondition(time.Second, func() bool {
+		return len(recA.dials()) == 1 && len(recB.dials()) == 1
+	}) {
+		t.Fatalf("dials = (wg-a %v, wg-b %v), want one in-flight connection through each named outbound", recA.dials(), recB.dials())
+	}
+
+	if err := wrapper.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	for i, proxyConn := range proxyConns {
+		_ = proxyConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		buf := make([]byte, 1)
+		if _, err := proxyConn.Read(buf); err == nil {
+			t.Fatalf("proxy connection %d still open, want closed after config unload", i)
+		}
+	}
+
+	if !waitForCondition(time.Second, func() bool {
+		return logs.FilterMessage("anytls session terminated").Len() == 2
+	}) {
+		t.Fatalf("termination audit logs = %d, want 2", logs.FilterMessage("anytls session terminated").Len())
+	}
+}
+
+// End-to-end per-user outbound selection through real authentication: two
+// accounts on the same wrapper egress through different outbounds, and the
+// Info-level established log carries the outbound name exactly once per
+// connection. The destination is an IP literal so each connection performs
+// exactly one deterministic DialContext.
+func TestPerUserOutboundSelectionEndToEnd(t *testing.T) {
+	core, logs := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core)
+
+	target, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("net.Listen() error = %v", err)
 	}
-	defer closeTest(client)
+	defer closeTest(target)
+	go func() {
+		for {
+			conn, acceptErr := target.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer closeTest(c)
+				line, readErr := bufio.NewReader(c).ReadString('\n')
+				if readErr != nil {
+					return
+				}
+				_, _ = io.WriteString(c, strings.ToUpper(line))
+			}(conn)
+		}
+	}()
+	targetAddress := target.Addr().String()
 
-	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
-	if err != nil {
-		t.Fatalf("CreateProxy() error = %v", err)
+	users := []User{
+		{Name: "home", Password: "home-pass", Enabled: true, Outbound: "wg-home"},
+		{Name: "away", Password: "away-pass", Enabled: true},
 	}
-	defer closeTest(proxyConn)
+	wrapper := newTestWrapper(t, users, true)
+	wrapper.logger = logger
+	recHome := &recordingOutbound{inner: new(DirectOutbound)}
+	recAway := &recordingOutbound{inner: new(DirectOutbound)}
+	wrapper.namedOutbounds = map[string]Outbound{"wg-home": recHome, "wg-away": recAway, "direct": new(DirectOutbound)}
+	wrapper.userOutbound = map[string]Outbound{"home": recHome}
+	wrapper.userOutboundName = map[string]string{"home": "wg-home"}
+	wrapper.defaultOutbound = recAway
+	wrapper.defaultOutboundName = "wg-away"
 
-	if _, err := io.WriteString(proxyConn, "hold-open\n"); err != nil {
-		t.Fatalf("WriteString() error = %v", err)
+	base := newChanListener()
+	defer closeTest(base)
+	go acceptLoop(t.Context(), wrapper.WrapListener(base))
+
+	for _, tt := range []struct {
+		user     string
+		password string
+		recorder *recordingOutbound
+		outbound string
+	}{
+		{user: "home", password: "home-pass", recorder: recHome, outbound: "wg-home"},
+		{user: "away", password: "away-pass", recorder: recAway, outbound: "wg-away"},
+	} {
+		client := newTestAnyTLSClient(t, base, tt.password)
+		proxyConn, err := client.CreateProxy(t.Context(), M.ParseSocksaddr(targetAddress))
+		if err != nil {
+			t.Fatalf("CreateProxy(%s) error = %v", tt.user, err)
+		}
+		if _, err := io.WriteString(proxyConn, "ping\n"); err != nil {
+			t.Fatalf("WriteString(%s) error = %v", tt.user, err)
+		}
+		if _, err := bufio.NewReader(proxyConn).ReadString('\n'); err != nil {
+			t.Fatalf("ReadString(%s) error = %v", tt.user, err)
+		}
+		closeTest(proxyConn)
+
+		dials := tt.recorder.dials()
+		if len(dials) != 1 || dials[0] != targetAddress {
+			t.Fatalf("user %s recorded dials = %v, want exactly [%s]", tt.user, dials, targetAddress)
+		}
+
+		userEntries := 0
+		for _, entry := range logs.FilterMessage("anytls connection established").All() {
+			fields := entry.ContextMap()
+			if fields["user"] != tt.user {
+				continue
+			}
+			userEntries++
+			if fields["outbound"] != tt.outbound {
+				t.Fatalf("established log outbound = %v, want %q for user %s", fields["outbound"], tt.outbound, tt.user)
+			}
+		}
+		if userEntries != 1 {
+			t.Fatalf("established log entries for user %s = %d, want exactly 1", tt.user, userEntries)
+		}
 	}
 
-	var destConn net.Conn
-	select {
-	case destConn = <-destReady:
-		defer closeTest(destConn)
-	case <-time.After(time.Second):
-		t.Fatal("destination connection was not established")
+	if dials := recHome.dials(); len(dials) != 1 {
+		t.Fatalf("recHome dials = %v, want no cross-user dials", dials)
 	}
-
-	if !waitForCondition(time.Second, func() bool { return wrapper.activeSessionCount() == 1 }) {
-		t.Fatal("expected one active session")
-	}
-
-	wrapper.closeActiveSessions("config_unload")
-
-	_ = proxyConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	buf := make([]byte, 1)
-	_, err = proxyConn.Read(buf)
-	if err == nil {
-		t.Fatal("expected closed proxy connection after config unload")
-	}
-
-	if !waitForLogs(logs, "anytls session terminated") {
-		t.Fatal("expected termination audit log")
+	if dials := recAway.dials(); len(dials) != 1 {
+		t.Fatalf("recAway dials = %v, want no cross-user dials", dials)
 	}
 }

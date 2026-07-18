@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -56,20 +57,42 @@ type ListenerWrapper struct {
 	NodeSNI              string         `json:"node_sni,omitempty"`
 	NodeInsecure         bool           `json:"node_insecure,omitempty"`
 
-	logger            *zap.Logger
-	active            int64
-	activeStreams     int64
-	connSeq           uint64
-	fallbackSet       bool
-	registry          *sessionRegistry
-	detector          Detector
-	service           *singanytls.Service
-	websiteConns      sync.Map
-	allowCIDRPrefixes []netip.Prefix
-	denyCIDRPrefixes  []netip.Prefix
-	dialFunc          func(ctx context.Context, network string, address string) (net.Conn, error)
-	listenPacketFunc  func(ctx context.Context, network string, address string) (net.PacketConn, error)
-	resolveFunc       func(ctx context.Context, network string, host string) ([]netip.Addr, error)
+	// OutboundRaw selects the module used to reach AnyTLS targets. When empty
+	// the built-in "direct" outbound is used. With named outbounds configured,
+	// it acts as the default outbound for users without an explicit reference
+	// (unless default_outbound overrides it).
+	OutboundRaw json.RawMessage `json:"outbound,omitempty" caddy:"namespace=caddy.listeners.anytls.outbounds inline_key=dialer"`
+
+	// OutboundsRaw declares named outbounds that users can reference by name.
+	// The names "direct" and "default" are reserved: "direct" always resolves
+	// to the built-in direct outbound and never needs to be declared.
+	OutboundsRaw map[string]json.RawMessage `json:"outbounds,omitempty" caddy:"namespace=caddy.listeners.anytls.outbounds inline_key=dialer"`
+
+	// DefaultOutbound selects the named outbound used for users without an
+	// explicit outbound reference. When empty, the single "outbound" module is
+	// used if configured, otherwise the built-in direct outbound.
+	DefaultOutbound string `json:"default_outbound,omitempty"`
+
+	logger              *zap.Logger
+	outbound            Outbound
+	namedOutbounds      map[string]Outbound
+	defaultOutbound     Outbound
+	defaultOutboundName string
+	userOutbound        map[string]Outbound
+	userOutboundName    map[string]string
+	active              int64
+	activeStreams       int64
+	connSeq             uint64
+	fallbackSet         bool
+	registry            *sessionRegistry
+	detector            Detector
+	service             *singanytls.Service
+	websiteConns        sync.Map
+	allowCIDRPrefixes   []netip.Prefix
+	denyCIDRPrefixes    []netip.Prefix
+	dialFunc            func(ctx context.Context, network string, address string) (net.Conn, error)
+	listenPacketFunc    func(ctx context.Context, network string, address string) (net.PacketConn, error)
+	resolveFunc         func(ctx context.Context, network string, host string) ([]netip.Addr, error)
 }
 
 // User defines one AnyTLS account.
@@ -77,6 +100,9 @@ type User struct {
 	Name     string `json:"name,omitempty"`
 	Password string `json:"password,omitempty"`
 	Enabled  bool   `json:"enabled,omitempty"`
+	// Outbound references a named outbound (or the built-in "direct") used
+	// for this user's egress traffic. Empty selects the default outbound.
+	Outbound string `json:"outbound,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -127,10 +153,29 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 		server.RegisterConnContext(lw.websiteConnContext)
 		server.RegisterConnState(lw.cleanupWebsiteConn)
 	}
-	ctx.OnCancel(func() {
-		lw.closeActiveSessions("config_unload")
-	})
 	if err := lw.compileCIDRPolicies(); err != nil {
+		return err
+	}
+
+	// A configured outbound is loaded only when the raw config is a real module
+	// object. An explicit JSON null (or an empty value) falls back to direct,
+	// matching the documented default.
+	hasSingleOutbound := len(lw.OutboundRaw) > 0 && string(lw.OutboundRaw) != "null"
+	if hasSingleOutbound {
+		mod, err := ctx.LoadModule(lw, "OutboundRaw")
+		if err != nil {
+			return fmt.Errorf("load outbound module: %w", err)
+		}
+		outbound, ok := mod.(Outbound)
+		if !ok {
+			return fmt.Errorf("configured outbound %T is not an anytls outbound", mod)
+		}
+		lw.outbound = outbound
+	}
+	if lw.outbound == nil {
+		lw.outbound = new(DirectOutbound)
+	}
+	if err := lw.provisionNamedOutbounds(ctx, hasSingleOutbound); err != nil {
 		return err
 	}
 
@@ -148,6 +193,109 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	lw.service = service
 	lw.logNodeInfo(server)
 
+	return nil
+}
+
+// provisionNamedOutbounds loads the declared named outbounds, injects the
+// built-in "direct" reserved name, resolves the default outbound, and builds
+// the per-user outbound maps. All reference validation happens here (not in
+// Validate) because ctx.LoadModule zeroes the raw fields and only the loaded
+// namedOutbounds map reflects the declared names. The resulting maps are
+// read-only after Provision, so concurrent reads at dial time need no locking.
+func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context, hasSingleOutbound bool) error {
+	// The reserved-name check must run before the built-in "direct" entry is
+	// injected, otherwise the injection would shadow a user declaration.
+	for name := range lw.OutboundsRaw {
+		if name == "" {
+			return errors.New("named outbound must not have an empty name")
+		}
+		if name == reservedOutboundDirect || name == reservedOutboundDefault {
+			return fmt.Errorf("outbound name %q is reserved", name)
+		}
+	}
+
+	lw.namedOutbounds = make(map[string]Outbound, len(lw.OutboundsRaw)+1)
+	if len(lw.OutboundsRaw) > 0 {
+		mods, err := ctx.LoadModule(lw, "OutboundsRaw")
+		if err != nil {
+			return fmt.Errorf("load named outbound modules: %w", err)
+		}
+		outboundMods, ok := mods.(map[string]any)
+		if !ok {
+			return fmt.Errorf("named outbound modules loaded as unexpected type %T", mods)
+		}
+		for name, mod := range outboundMods {
+			outbound, ok := mod.(Outbound)
+			if !ok {
+				return fmt.Errorf("named outbound %q: configured module %T is not an anytls outbound", name, mod)
+			}
+			lw.namedOutbounds[name] = outbound
+		}
+	}
+	lw.namedOutbounds[reservedOutboundDirect] = new(DirectOutbound)
+
+	// Default outbound resolution order (backward compatible):
+	// default_outbound name > single "outbound" module > built-in direct.
+	switch {
+	case lw.DefaultOutbound != "":
+		outbound, ok := lw.namedOutbounds[lw.DefaultOutbound]
+		if !ok {
+			return fmt.Errorf("default_outbound %q references an undeclared outbound", lw.DefaultOutbound)
+		}
+		lw.defaultOutbound = outbound
+		lw.defaultOutboundName = lw.DefaultOutbound
+	case hasSingleOutbound:
+		lw.defaultOutbound = lw.outbound
+		lw.defaultOutboundName = reservedOutboundDefault
+	default:
+		lw.defaultOutbound = lw.outbound
+		lw.defaultOutboundName = reservedOutboundDirect
+	}
+
+	// Both maps hold entries only for users with an explicit outbound
+	// reference and always share the same key set.
+	lw.userOutbound = make(map[string]Outbound)
+	lw.userOutboundName = make(map[string]string)
+	for _, user := range lw.Users {
+		if user.Outbound == "" {
+			continue
+		}
+		outbound, ok := lw.namedOutbounds[user.Outbound]
+		if !ok {
+			return fmt.Errorf("user %q references an undeclared outbound %q", user.Name, user.Outbound)
+		}
+		lw.userOutbound[user.Name] = outbound
+		lw.userOutboundName[user.Name] = user.Outbound
+	}
+
+	return nil
+}
+
+// resolveDefaultOutbound returns the outbound and log name used when the
+// authenticated user has no explicit outbound reference. Provision always
+// sets defaultOutbound; the trailing config.outbound and DirectOutbound
+// tiers keep wrappers built without Provision (hand-made test fixtures)
+// working.
+func (lw *ListenerWrapper) resolveDefaultOutbound() (Outbound, string) {
+	if lw.defaultOutbound != nil {
+		return lw.defaultOutbound, lw.defaultOutboundName
+	}
+	if lw.outbound != nil {
+		return lw.outbound, reservedOutboundDefault
+	}
+	return &DirectOutbound{}, reservedOutboundDirect
+}
+
+// Cleanup closes all active AnyTLS sessions when the config is unloaded.
+// This must be the module's own Cleanup: callbacks registered via
+// ctx.OnCancel inside Provision are appended to a copy of the caddy.Context
+// (value receiver) and never run in caddy v2.11.4. Note that caddy gives no
+// ordering guarantee across module cleanups, so outbound modules may be
+// cleaned up before or after this runs.
+func (lw *ListenerWrapper) Cleanup() error {
+	if lw.registry != nil {
+		lw.closeActiveSessions("config_unload")
+	}
 	return nil
 }
 
@@ -214,6 +362,7 @@ func (lw *ListenerWrapper) WrapListener(l net.Listener) net.Listener {
 var (
 	_ caddy.Provisioner     = (*ListenerWrapper)(nil)
 	_ caddy.Validator       = (*ListenerWrapper)(nil)
+	_ caddy.CleanerUpper    = (*ListenerWrapper)(nil)
 	_ caddy.ListenerWrapper = (*ListenerWrapper)(nil)
 	_ caddyfile.Unmarshaler = (*ListenerWrapper)(nil)
 )

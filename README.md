@@ -10,6 +10,7 @@ Caddy 继续负责 `443` 监听、TLS、证书和网站路由；本模块只在 
 - 复用 Caddy 自动 HTTPS 和证书生命周期
 - 非 AnyTLS 流量回落真实网站
 - 支持多用户、TCP 和 `UDP over TCP v2`
+- 支持多个具名出站并按用户选择出口（如部分账号走 WireGuard 家宽、部分直连）
 - 默认拒绝私网目标，支持 CIDR、端口和域名策略
 - TLS 握手与首包探测采用有界并发，不阻塞 Caddy 的接收循环
 - 空闲超时按双向活动刷新，支持单向长时间传输
@@ -165,6 +166,9 @@ example.com {
 | `allow_cidr` / `deny_cidr` | 无 | 按解析后的目标 IP CIDR 放行或拒绝 |
 | `allow_port` / `deny_port` | 无 | 按目标端口放行或拒绝 |
 | `allow_domain` / `deny_domain` | 无 | 按域名或域名后缀放行或拒绝 |
+| `outbound <module> { ... }` | `direct` | 选择默认出站模块，决定认证后的目标流量从哪里发出 |
+| `outbound <name> <module> { ... }` | 无 | 声明一个具名出站，供 `user` 或 `default_outbound` 按名引用 |
+| `default_outbound <name>` | 无 | 未标注出站的用户使用的具名出站；不写时依次落到单 `outbound`、内置 `direct` |
 
 策略规则：
 
@@ -178,12 +182,79 @@ example.com {
 
 | Caddyfile 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `user <name> <password>` | 无 | 添加一个启用用户；用户名和密码都必须唯一 |
+| `user <name> <password> [outbound]` | 无 | 添加一个启用用户；用户名和密码都必须唯一；第 3 个参数按名引用具名出站（或内置 `direct`），省略走默认出站 |
 | `log_node_info` | `false` | 启动或重载时是否把节点 URI 写入日志 |
 | `node_host` | 从站点 host matcher 推断 | 节点域名或地址，可配置多个 |
 | `node_port` | 从 server listen 推断，通常为 `443` | 节点端口 |
 | `node_sni` | 同 `node_host` | 节点 URI 中的 SNI |
 | `node_insecure` | `false` | 是否在节点 URI 中输出 `insecure=1` |
+
+## 出站 (outbound)
+
+认证通过后，目标流量默认由运行 Caddy 的这台机器直接发出（内置 `direct` 出站）。你也可以用 `outbound` 指令切换到其它出站模块，把出口流量转发到别处，例如经 WireGuard 隧道从另一台家宽服务器出站，用住宅 IP 出网。
+
+WireGuard 的密钥、端点和隧道地址属于出口资源，应在 `caddy-wireguard` 的全局配置中集中定义；`anytls` 只引用该隧道：
+
+```caddyfile
+{
+    wireguard {
+        tunnel home {
+            private_key          <base64 客户端私钥>
+            peer_public_key      <base64 服务端公钥>
+            endpoint             home.example.com:51820
+            address              10.7.0.2
+            allowed_ips          0.0.0.0/0 ::/0
+            dns                  1.1.1.1
+            persistent_keepalive 25
+        }
+    }
+
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                user phone-1 replace-with-strong-password
+                outbound wireguard {
+                    tunnel home
+                }
+            }
+        }
+    }
+}
+```
+
+还可以声明多个具名出站，让不同账号走不同出口（客户端配置多个仅密码不同的节点即可切换）：
+
+```caddyfile
+anytls {
+    outbound wg-home wireguard {
+        tunnel home
+    }
+    default_outbound wg-home
+
+    user phone-home   replace-with-password-1          # -> 默认（wg-home）
+    user phone-direct replace-with-password-2 direct   # -> 内置直连
+}
+```
+
+- 出站模块注册在 `caddy.listeners.anytls.outbounds` 命名空间下。
+- 内置 `direct` 无需配置，是不写 `outbound` 时的默认行为；也可被 `user` 直接按名引用，无需声明。
+- 保留名 `direct` 和 `default` 不允许作为具名出站的名字；引用未声明的出站名会在配置阶段报错。
+- 未标注出站的用户按 `default_outbound` → 单 `outbound` → 内置 `direct` 的顺序解析默认出口，老配置行为不变。
+- 连接建立日志（`anytls connection established`）与节点日志带 `outbound` 字段，标注该连接/该账号实际使用的出站名。
+- 域名由认证用户实际选中的出站解析：`direct` 使用宿主机 DNS，隧道出站必须让 DNS 请求经过隧道。
+- 出站把解析结果返回 wrapper；wrapper 在拨号前完成私网、CIDR、端口和域名策略校验，然后通过同一出站连接已校验的 IP。
+- 推荐在全局块集中配置 WireGuard 隧道，再在 `anytls` 中通过 `tunnel <name>` 引用；这也允许 `reverse_proxy` 等其它模块安全共享同一个 device。
+- WireGuard 出站是一个独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)，用户态实现（wireguard-go + netstack），无需内核模块、TUN 设备或 root。构建方式：
+
+```sh
+xcaddy build \
+    --with github.com/evaneonf/caddy-anytls \
+    --with github.com/lihuaye/caddy-wireguard
+```
+
+配置项、密钥生成和家宽侧准备见该仓库的 README。
+
+## 获取客户端 URI
 
 如需临时获取客户端 URI，可在现有 `listener_wrappers` 的 `anytls` 配置块中加入：
 
@@ -230,7 +301,7 @@ JSON 配置使用相应的复数数组字段，例如 `users`、`allow_cidrs`、
 
 - `connection_id`、`event`、`outcome`、`reason`
 - `protocol`、`uot_is_connect`
-- `user`、`source`、`destination`
+- `user`、`outbound`、`source`、`destination`
 - `duration`
 - `bytes_from_client`、`bytes_to_client`
 - `bytes_from_target`、`bytes_to_target`
