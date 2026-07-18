@@ -338,6 +338,7 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 
 func setupHandshakeSuccessTCP(t *testing.T, wrapper *ListenerWrapper) {
 	t.Helper()
+	wrapper.resolveFunc = resolveTestDomain
 	targetConn, targetPeer := net.Pipe()
 	t.Cleanup(func() {
 		closeTest(targetConn)
